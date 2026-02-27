@@ -110,6 +110,8 @@ class MetalContext:
         Render target height in pixels.
     """
 
+    MSAA_SAMPLE_COUNT = 4
+
     def __init__(self, width: int, height: int) -> None:
         self.width = width
         self.height = height
@@ -124,8 +126,9 @@ class MetalContext:
         self._libraries: dict[str, Metal.MTLLibrary] = {}
         self._compile_shaders()
 
-        # Create render targets
+        # Create render targets (MSAA + resolve)
         self._create_render_target()
+        self._create_msaa_target()
         self._create_stencil_target()
 
         # Create pipeline states
@@ -166,6 +169,7 @@ class MetalContext:
     # ------------------------------------------------------------------
 
     def _create_render_target(self) -> None:
+        """Non-MSAA resolve target (CPU-readable for readback)."""
         make_tex = Metal.MTLTextureDescriptor
         desc = make_tex.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
             Metal.MTLPixelFormatBGRA8Unorm,
@@ -177,16 +181,27 @@ class MetalContext:
         desc.setStorageMode_(Metal.MTLStorageModeShared)  # UMA — CPU-readable
         self.render_target = self.device.newTextureWithDescriptor_(desc)
 
-    def _create_stencil_target(self) -> None:
-        make_tex = Metal.MTLTextureDescriptor
-        desc = make_tex.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-            Metal.MTLPixelFormatStencil8,
-            self.width,
-            self.height,
-            False,
-        )
+    def _create_msaa_target(self) -> None:
+        """4x MSAA color texture — rendering goes here, then resolves to render_target."""
+        desc = Metal.MTLTextureDescriptor.alloc().init()
+        desc.setTextureType_(Metal.MTLTextureType2DMultisample)
+        desc.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+        desc.setWidth_(self.width)
+        desc.setHeight_(self.height)
+        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
         desc.setUsage_(Metal.MTLTextureUsageRenderTarget)
-        # Use private storage if available (GPU-only, faster)
+        desc.setStorageMode_(Metal.MTLStorageModePrivate)
+        self.msaa_target = self.device.newTextureWithDescriptor_(desc)
+
+    def _create_stencil_target(self) -> None:
+        """MSAA stencil texture (must match MSAA sample count)."""
+        desc = Metal.MTLTextureDescriptor.alloc().init()
+        desc.setTextureType_(Metal.MTLTextureType2DMultisample)
+        desc.setPixelFormat_(Metal.MTLPixelFormatStencil8)
+        desc.setWidth_(self.width)
+        desc.setHeight_(self.height)
+        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
+        desc.setUsage_(Metal.MTLTextureUsageRenderTarget)
         desc.setStorageMode_(Metal.MTLStorageModePrivate)
         self.stencil_target = self.device.newTextureWithDescriptor_(desc)
 
@@ -196,6 +211,7 @@ class MetalContext:
 
     def _make_fill_stencil_pipeline(self):
         desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
+        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
         desc.setVertexFunction_(self._get_function("fill", "fill_stencil_vertex"))
         desc.setFragmentFunction_(self._get_function("fill", "fill_stencil_fragment"))
         desc.colorAttachments().objectAtIndexedSubscript_(0).setPixelFormat_(
@@ -213,6 +229,7 @@ class MetalContext:
 
     def _make_fill_cover_pipeline(self):
         desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
+        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
         desc.setVertexFunction_(self._get_function("fill", "fill_cover_vertex"))
         desc.setFragmentFunction_(self._get_function("fill", "fill_cover_fragment"))
         ca = desc.colorAttachments().objectAtIndexedSubscript_(0)
@@ -231,6 +248,7 @@ class MetalContext:
 
     def _make_stroke_pipeline(self):
         desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
+        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
         desc.setVertexFunction_(self._get_function("stroke", "stroke_vertex"))
         desc.setFragmentFunction_(self._get_function("stroke", "stroke_fragment"))
         ca = desc.colorAttachments().objectAtIndexedSubscript_(0)
@@ -288,7 +306,10 @@ class MetalContext:
     # ------------------------------------------------------------------
 
     def make_render_pass_descriptor(self, clear: bool = False, clear_color=None):
-        """Create a render pass descriptor targeting the offscreen texture.
+        """Create a render pass descriptor targeting the MSAA texture.
+
+        Rendering goes into ``msaa_target``; at store time Metal resolves
+        into ``render_target`` (non-MSAA, CPU-readable).
 
         Parameters
         ----------
@@ -300,13 +321,14 @@ class MetalContext:
         rpd = Metal.MTLRenderPassDescriptor.renderPassDescriptor()
 
         ca = rpd.colorAttachments().objectAtIndexedSubscript_(0)
-        ca.setTexture_(self.render_target)
+        ca.setTexture_(self.msaa_target)
+        ca.setResolveTexture_(self.render_target)
         if clear and clear_color is not None:
             ca.setLoadAction_(Metal.MTLLoadActionClear)
             ca.setClearColor_(Metal.MTLClearColor(*clear_color))
         else:
             ca.setLoadAction_(Metal.MTLLoadActionLoad)
-        ca.setStoreAction_(Metal.MTLStoreActionStore)
+        ca.setStoreAction_(Metal.MTLStoreActionMultisampleResolve)
 
         sa = rpd.stencilAttachment()
         sa.setTexture_(self.stencil_target)
@@ -315,7 +337,7 @@ class MetalContext:
             sa.setClearStencil_(0)
         else:
             sa.setLoadAction_(Metal.MTLLoadActionLoad)
-        sa.setStoreAction_(Metal.MTLStoreActionStore)
+        sa.setStoreAction_(Metal.MTLStoreActionDontCare)
 
         return rpd
 

@@ -80,7 +80,7 @@ def vmobject_to_triangles(
     n_curves = len(points) // 4
     points_2d = points[: n_curves * 4, :2]
 
-    polyline = _linearize_beziers_batch(points_2d, n_samples=8)
+    polyline = _linearize_beziers_batch(points_2d, n_samples=32)
 
     # Remove consecutive duplicates
     mask = np.ones(len(polyline), dtype=bool)
@@ -129,7 +129,7 @@ def vmobject_to_stroke_quads(
     n_curves = len(points) // 4
     points_2d = points[: n_curves * 4, :2]
 
-    polyline = _linearize_beziers_batch(points_2d, n_samples=8)
+    polyline = _linearize_beziers_batch(points_2d, n_samples=32)
 
     # Remove consecutive duplicates
     mask = np.ones(len(polyline), dtype=bool)

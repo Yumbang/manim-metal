@@ -78,36 +78,44 @@ class _EncoderStateTracker:
 
 
 class _GeometryCache:
-    """Cache tessellated geometry keyed on object/points identity.
+    """Cache tessellated geometry keyed on VMobject identity.
 
-    When Manim animates a VMobject it replaces the .points array reference,
-    changing ``id(vmob.points)`` and causing a cache miss.  Static objects
-    keep the same reference, giving cache hits and skipping tessellation.
+    Each entry stores a reference to the points array alongside the cached
+    result.  On lookup we use ``is`` to verify the points object is literally
+    the same — this is safe against CPython ``id()`` reuse because holding
+    the reference prevents the old array from being garbage-collected.
+
+    When Manim animates a VMobject it replaces ``.points`` with a new array,
+    so the ``is`` check fails and we re-tessellate.
     """
 
     __slots__ = ("_fill", "_stroke")
 
     def __init__(self) -> None:
-        self._fill: dict[tuple[int, int], np.ndarray] = {}
-        self._stroke: dict[tuple[int, int, float], np.ndarray] = {}
+        # id(vmob) -> (points_array_ref, cached_result)
+        self._fill: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        # id(vmob) -> (points_array_ref, stroke_width, cached_result)
+        self._stroke: dict[int, tuple[np.ndarray, float, np.ndarray]] = {}
 
     def get_fill(self, vmob: VMobject) -> np.ndarray | None:
-        key = (id(vmob), id(vmob.points))
-        return self._fill.get(key)
+        entry = self._fill.get(id(vmob))
+        if entry is not None and entry[0] is vmob.points:
+            return entry[1]
+        return None
 
     def put_fill(self, vmob: VMobject, triangles: np.ndarray) -> None:
-        key = (id(vmob), id(vmob.points))
-        self._fill[key] = triangles
+        self._fill[id(vmob)] = (vmob.points, triangles)
 
     def get_stroke(self, vmob: VMobject, stroke_width: float) -> np.ndarray | None:
-        key = (id(vmob), id(vmob.points), stroke_width)
-        return self._stroke.get(key)
+        entry = self._stroke.get(id(vmob))
+        if entry is not None and entry[0] is vmob.points and entry[1] == stroke_width:
+            return entry[2]
+        return None
 
     def put_stroke(
         self, vmob: VMobject, stroke_width: float, quads: np.ndarray
     ) -> None:
-        key = (id(vmob), id(vmob.points), stroke_width)
-        self._stroke[key] = quads
+        self._stroke[id(vmob)] = (vmob.points, stroke_width, quads)
 
     def clear(self) -> None:
         self._fill.clear()
@@ -269,7 +277,9 @@ class MetalCamera:
 
         # --- Pass 2: Encode draw commands ---
         cmd = self.ctx.command_queue.commandBuffer()
-        rpd = self.ctx.make_render_pass_descriptor(clear=False)
+        rpd = self.ctx.make_render_pass_descriptor(
+            clear=True, clear_color=self._bg_color_float
+        )
         raw_encoder = cmd.renderCommandEncoderWithDescriptor_(rpd)
         raw_encoder.setViewport_(
             (
