@@ -13,6 +13,91 @@ if TYPE_CHECKING:
 
 _SHADER_DIR = Path(__file__).parent / "shaders"
 
+# Metal requires buffer offsets to be 256-byte aligned
+_BUFFER_ALIGNMENT = 256
+_INITIAL_POOL_SIZE = 16 * 1024 * 1024  # 16 MB
+
+
+class BufferPool:
+    """Staging allocator that collects frame data into a single MTLBuffer.
+
+    All vertex/uniform data is written into a Python-side bytearray during
+    the staging pass.  :meth:`finalize` creates a single ``MTLBuffer`` from
+    the accumulated data—reducing per-object ``newBufferWithBytes`` calls to
+    one call per frame.
+
+    Parameters
+    ----------
+    device
+        The Metal device to allocate from.
+    initial_size
+        Initial staging capacity in bytes.
+    """
+
+    def __init__(self, device, initial_size: int = _INITIAL_POOL_SIZE) -> None:
+        self._device = device
+        self._data = bytearray(initial_size)
+        self._capacity = initial_size
+        self._offset = 0
+
+    def reset(self) -> None:
+        """Rewind the allocator to the start. Call at the beginning of each frame."""
+        self._offset = 0
+
+    def stage(self, data: np.ndarray) -> int:
+        """Copy *data* into the staging bytearray and return its byte offset.
+
+        Parameters
+        ----------
+        data
+            NumPy array to copy.
+
+        Returns
+        -------
+        int
+            Byte offset into the shared buffer (available after :meth:`finalize`).
+        """
+        byte_data = data.tobytes()
+        size = len(byte_data)
+
+        needed = self._offset + size
+        if needed > self._capacity:
+            self._grow(needed)
+
+        self._data[self._offset : self._offset + size] = byte_data
+        offset = self._offset
+
+        # Advance with 256-byte alignment
+        self._offset = (self._offset + size + _BUFFER_ALIGNMENT - 1) & ~(
+            _BUFFER_ALIGNMENT - 1
+        )
+        return offset
+
+    def finalize(self):
+        """Create a single MTLBuffer from all staged data.
+
+        Returns
+        -------
+        MTLBuffer or None
+            The shared buffer, or ``None`` if nothing was staged.
+        """
+        if self._offset == 0:
+            return None
+        return self._device.newBufferWithBytes_length_options_(
+            bytes(self._data[: self._offset]),
+            self._offset,
+            Metal.MTLResourceStorageModeShared,
+        )
+
+    def _grow(self, min_capacity: int) -> None:
+        new_cap = self._capacity
+        while new_cap < min_capacity:
+            new_cap *= 2
+        new_data = bytearray(new_cap)
+        new_data[: self._offset] = self._data[: self._offset]
+        self._data = new_data
+        self._capacity = new_cap
+
 
 class MetalContext:
     """Manages Metal device, command queue, compiled shaders, and render targets.
@@ -52,6 +137,9 @@ class MetalContext:
         self._stencil_increment_dss = self._make_stencil_increment_state()
         self._stencil_nonzero_dss = self._make_stencil_nonzero_state()
         self._stencil_disabled_dss = self._make_stencil_disabled_state()
+
+        # Buffer pool for sub-allocation
+        self.buffer_pool = BufferPool(self.device)
 
     # ------------------------------------------------------------------
     # Shader compilation

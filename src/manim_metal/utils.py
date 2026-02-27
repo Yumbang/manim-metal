@@ -10,6 +10,48 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 
+def _linearize_beziers_batch(
+    points_2d: npt.NDArray[np.float64],
+    n_samples: int = 8,
+) -> npt.NDArray[np.float64]:
+    """Linearize all cubic Bézier curves in a single batched NumPy operation.
+
+    Parameters
+    ----------
+    points_2d
+        (n_curves*4, 2) array of 2D control points (already xy-sliced).
+    n_samples
+        Number of sample points per curve.
+
+    Returns
+    -------
+    np.ndarray
+        (n_curves * n_samples, 2) array of linearized points.
+    """
+    n_curves = len(points_2d) // 4
+    if n_curves == 0:
+        return np.empty((0, 2), dtype=np.float64)
+
+    # Reshape to (n_curves, 4, 2) — P0, P1, P2, P3 per curve
+    ctrl = points_2d[: n_curves * 4].reshape(n_curves, 4, 2)
+
+    # t values: (n_samples, 1, 1) for broadcasting against (n_curves, 4, 2)
+    t = np.linspace(0, 1, n_samples, dtype=np.float64).reshape(n_samples, 1, 1)
+    mt = 1.0 - t
+
+    # De Casteljau cubic evaluation — fully vectorized
+    # Result shape: (n_samples, n_curves, 2)
+    curve_pts = (
+        mt**3 * ctrl[:, 0]
+        + 3 * mt**2 * t * ctrl[:, 1]
+        + 3 * mt * t**2 * ctrl[:, 2]
+        + t**3 * ctrl[:, 3]
+    )
+
+    # Transpose to (n_curves, n_samples, 2), then flatten to (n_curves*n_samples, 2)
+    return curve_pts.transpose(1, 0, 2).reshape(-1, 2)
+
+
 def vmobject_to_triangles(
     points: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float32]:
@@ -34,27 +76,11 @@ def vmobject_to_triangles(
     if len(points) < 4:
         return np.empty((0, 2), dtype=np.float32)
 
-    # Linearize each cubic Bézier into line segments
+    # Extract xy and linearize all curves at once
     n_curves = len(points) // 4
-    t_values = np.linspace(0, 1, 8, dtype=np.float64)  # 8 samples per curve
+    points_2d = points[: n_curves * 4, :2]
 
-    linearized = []
-    for i in range(n_curves):
-        p0 = points[4 * i][:2]
-        p1 = points[4 * i + 1][:2]
-        p2 = points[4 * i + 2][:2]
-        p3 = points[4 * i + 3][:2]
-
-        # De Casteljau evaluation for cubic Bézier
-        t = t_values[:, np.newaxis]
-        mt = 1.0 - t
-        curve_pts = mt**3 * p0 + 3 * mt**2 * t * p1 + 3 * mt * t**2 * p2 + t**3 * p3
-        linearized.append(curve_pts)
-
-    if not linearized:
-        return np.empty((0, 2), dtype=np.float32)
-
-    polyline = np.concatenate(linearized, axis=0)
+    polyline = _linearize_beziers_batch(points_2d, n_samples=8)
 
     # Remove consecutive duplicates
     mask = np.ones(len(polyline), dtype=bool)
@@ -99,26 +125,11 @@ def vmobject_to_stroke_quads(
     if len(points) < 4 or stroke_width <= 0:
         return np.empty((0, 2), dtype=np.float32)
 
-    # Linearize
+    # Extract xy and linearize all curves at once
     n_curves = len(points) // 4
-    t_values = np.linspace(0, 1, 8, dtype=np.float64)
+    points_2d = points[: n_curves * 4, :2]
 
-    linearized = []
-    for i in range(n_curves):
-        p0 = points[4 * i][:2]
-        p1 = points[4 * i + 1][:2]
-        p2 = points[4 * i + 2][:2]
-        p3 = points[4 * i + 3][:2]
-
-        t = t_values[:, np.newaxis]
-        mt = 1.0 - t
-        curve_pts = mt**3 * p0 + 3 * mt**2 * t * p1 + 3 * mt * t**2 * p2 + t**3 * p3
-        linearized.append(curve_pts)
-
-    if not linearized:
-        return np.empty((0, 2), dtype=np.float32)
-
-    polyline = np.concatenate(linearized, axis=0)
+    polyline = _linearize_beziers_batch(points_2d, n_samples=8)
 
     # Remove consecutive duplicates
     mask = np.ones(len(polyline), dtype=bool)
@@ -129,36 +140,43 @@ def vmobject_to_stroke_quads(
         return np.empty((0, 2), dtype=np.float32)
 
     half_w = stroke_width / 2.0
-    n_segments = len(polyline) - 1
-    # 6 vertices per segment (2 triangles)
-    quads = np.empty((n_segments * 6, 2), dtype=np.float32)
 
-    for i in range(n_segments):
-        a = polyline[i]
-        b = polyline[i + 1]
-        d = b - a
-        length = np.linalg.norm(d)
-        if length < 1e-10:
-            quads[i * 6 : (i + 1) * 6] = a.astype(np.float32)
-            continue
-        # Normal perpendicular to segment
-        n = np.array([-d[1], d[0]]) / length * half_w
+    # Vectorized stroke expansion
+    a = polyline[:-1]  # (n_segments, 2) — start of each segment
+    b = polyline[1:]   # (n_segments, 2) — end of each segment
+    d = b - a          # direction vectors
+    lengths = np.sqrt(d[:, 0] ** 2 + d[:, 1] ** 2)  # segment lengths
 
-        # Four corners of the quad
-        p0 = (a + n).astype(np.float32)
-        p1 = (a - n).astype(np.float32)
-        p2 = (b + n).astype(np.float32)
-        p3 = (b - n).astype(np.float32)
+    # Handle degenerate segments (length ≈ 0)
+    safe_lengths = np.where(lengths < 1e-10, 1.0, lengths)
 
-        # Two triangles: (p0, p1, p2) and (p1, p3, p2)
-        quads[i * 6 + 0] = p0
-        quads[i * 6 + 1] = p1
-        quads[i * 6 + 2] = p2
-        quads[i * 6 + 3] = p1
-        quads[i * 6 + 4] = p3
-        quads[i * 6 + 5] = p2
+    # Normal perpendicular to segment direction, scaled by half_w
+    normals = np.empty_like(d)
+    normals[:, 0] = -d[:, 1] / safe_lengths * half_w
+    normals[:, 1] = d[:, 0] / safe_lengths * half_w
 
-    return quads
+    # Four corners of each quad: (n_segments, 2) each
+    p0 = a + normals
+    p1 = a - normals
+    p2 = b + normals
+    p3 = b - normals
+
+    # Build 6 vertices per segment: two triangles (p0,p1,p2) and (p1,p3,p2)
+    n_segments = len(a)
+    quads = np.empty((n_segments, 6, 2), dtype=np.float32)
+    quads[:, 0] = p0
+    quads[:, 1] = p1
+    quads[:, 2] = p2
+    quads[:, 3] = p1
+    quads[:, 4] = p3
+    quads[:, 5] = p2
+
+    # Zero out degenerate segments
+    degen_mask = lengths < 1e-10
+    if np.any(degen_mask):
+        quads[degen_mask] = a[degen_mask, np.newaxis, :].astype(np.float32)
+
+    return quads.reshape(-1, 2)
 
 
 def build_world_to_ndc_matrix(

@@ -26,6 +26,99 @@ if TYPE_CHECKING:
     from manim.typing import PixelArray
 
 
+# ---------------------------------------------------------------------------
+# Draw operation types for two-pass rendering
+# ---------------------------------------------------------------------------
+
+# Each draw op is a tuple: (kind, ...) where kind is one of:
+_OP_FILL_STENCIL = 0  # (kind, vert_offset, vert_count, uniform_offset)
+_OP_FILL_COVER = 1  # (kind, bbox_offset, uniform_offset)
+_OP_STROKE = 2  # (kind, vert_offset, vert_count, uniform_offset)
+
+
+# ---------------------------------------------------------------------------
+# Encoder state tracker — avoids redundant pyobjc calls
+# ---------------------------------------------------------------------------
+
+
+class _EncoderStateTracker:
+    """Thin wrapper around a render command encoder that skips redundant state calls."""
+
+    __slots__ = ("_encoder", "_pso", "_dss", "_stencil_ref")
+
+    def __init__(self, encoder) -> None:
+        self._encoder = encoder
+        self._pso = None
+        self._dss = None
+        self._stencil_ref = None
+
+    def set_pipeline(self, pso) -> None:
+        if pso is not self._pso:
+            self._encoder.setRenderPipelineState_(pso)
+            self._pso = pso
+
+    def set_depth_stencil(self, dss) -> None:
+        if dss is not self._dss:
+            self._encoder.setDepthStencilState_(dss)
+            self._dss = dss
+
+    def set_stencil_ref(self, ref: int) -> None:
+        if ref != self._stencil_ref:
+            self._encoder.setStencilReferenceValue_(ref)
+            self._stencil_ref = ref
+
+    @property
+    def encoder(self):
+        return self._encoder
+
+
+# ---------------------------------------------------------------------------
+# Geometry cache — skip tessellation for static objects
+# ---------------------------------------------------------------------------
+
+
+class _GeometryCache:
+    """Cache tessellated geometry keyed on object/points identity.
+
+    When Manim animates a VMobject it replaces the .points array reference,
+    changing ``id(vmob.points)`` and causing a cache miss.  Static objects
+    keep the same reference, giving cache hits and skipping tessellation.
+    """
+
+    __slots__ = ("_fill", "_stroke")
+
+    def __init__(self) -> None:
+        self._fill: dict[tuple[int, int], np.ndarray] = {}
+        self._stroke: dict[tuple[int, int, float], np.ndarray] = {}
+
+    def get_fill(self, vmob: VMobject) -> np.ndarray | None:
+        key = (id(vmob), id(vmob.points))
+        return self._fill.get(key)
+
+    def put_fill(self, vmob: VMobject, triangles: np.ndarray) -> None:
+        key = (id(vmob), id(vmob.points))
+        self._fill[key] = triangles
+
+    def get_stroke(self, vmob: VMobject, stroke_width: float) -> np.ndarray | None:
+        key = (id(vmob), id(vmob.points), stroke_width)
+        return self._stroke.get(key)
+
+    def put_stroke(
+        self, vmob: VMobject, stroke_width: float, quads: np.ndarray
+    ) -> None:
+        key = (id(vmob), id(vmob.points), stroke_width)
+        self._stroke[key] = quads
+
+    def clear(self) -> None:
+        self._fill.clear()
+        self._stroke.clear()
+
+
+# ---------------------------------------------------------------------------
+# MetalCamera
+# ---------------------------------------------------------------------------
+
+
 class MetalCamera:
     """Minimal camera that renders mobjects via Metal.
 
@@ -74,7 +167,9 @@ class MetalCamera:
             self._background_color = ManimColor.parse(background_color)
 
         self._background_opacity = (
-            background_opacity if background_opacity is not None else config["background_opacity"]
+            background_opacity
+            if background_opacity is not None
+            else config["background_opacity"]
         )
 
         # Background RGBA as normalized floats
@@ -89,11 +184,19 @@ class MetalCamera:
             (self.pixel_height, self.pixel_width, 4), dtype=np.uint8
         )
         # Fill with background color
-        self.pixel_array[:, :] = color_to_int_rgba(self._background_color, self._background_opacity)
+        self.pixel_array[:, :] = color_to_int_rgba(
+            self._background_color, self._background_opacity
+        )
         self.background = self.pixel_array.copy()
 
-        # Pre-compute MVP matrix
-        self._mvp = build_world_to_ndc_matrix(self.frame_width, self.frame_height, 0.0, 0.0)
+        # Pre-compute MVP matrix and its flattened form
+        self._mvp = build_world_to_ndc_matrix(
+            self.frame_width, self.frame_height, 0.0, 0.0
+        )
+        self._mvp_flat = self._mvp.flatten()  # 16 floats, cached
+
+        # Geometry cache
+        self._geo_cache = _GeometryCache()
 
     @property
     def background_color(self):
@@ -132,7 +235,12 @@ class MetalCamera:
         excluded_mobjects: list | None = None,
         **kwargs: Any,
     ) -> None:
-        """Render mobjects into the Metal render target."""
+        """Render mobjects into the Metal render target.
+
+        Uses a two-pass approach:
+          Pass 1 — stage all geometry/uniform data into a BufferPool bytearray.
+          Pass 2 — create one MTLBuffer, then encode all draw commands.
+        """
         mobjects = self._get_mobjects_to_display(
             mobjects,
             include_submobjects=include_submobjects,
@@ -143,21 +251,43 @@ class MetalCamera:
             self._readback_texture()
             return
 
-        # Encode all VMobject draw calls in a single command buffer
-        cmd = self.ctx.command_queue.commandBuffer()
-        rpd = self.ctx.make_render_pass_descriptor(clear=False)
-        encoder = cmd.renderCommandEncoderWithDescriptor_(rpd)
-        encoder.setViewport_(
-            (0.0, 0.0, float(self.pixel_width), float(self.pixel_height), 0.0, 1.0)
-        )
+        # --- Pass 1: Stage geometry and uniforms ---
+        pool = self.ctx.buffer_pool
+        pool.reset()
 
-        mvp_buffer = self.ctx.make_buffer(self._mvp)
-
+        draw_ops: list[tuple] = []
         for mob in mobjects:
             if isinstance(mob, VMobject):
-                self._encode_vmobject(encoder, mob, mvp_buffer)
+                self._stage_vmobject(mob, pool, draw_ops)
 
-        encoder.endEncoding()
+        if not draw_ops:
+            self._readback_texture()
+            return
+
+        # Create single shared MTLBuffer from staged data
+        shared_buf = pool.finalize()
+
+        # --- Pass 2: Encode draw commands ---
+        cmd = self.ctx.command_queue.commandBuffer()
+        rpd = self.ctx.make_render_pass_descriptor(clear=False)
+        raw_encoder = cmd.renderCommandEncoderWithDescriptor_(rpd)
+        raw_encoder.setViewport_(
+            (
+                0.0,
+                0.0,
+                float(self.pixel_width),
+                float(self.pixel_height),
+                0.0,
+                1.0,
+            )
+        )
+
+        tracker = _EncoderStateTracker(raw_encoder)
+
+        for op in draw_ops:
+            self._execute_draw_op(tracker, raw_encoder, shared_buf, op)
+
+        raw_encoder.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
 
@@ -171,7 +301,7 @@ class MetalCamera:
         return Image.fromarray(pixel_array, mode=self.image_mode)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers — Pass 1: staging
     # ------------------------------------------------------------------
 
     def _get_mobjects_to_display(
@@ -194,8 +324,10 @@ class MetalCamera:
                 mobjects = list_difference_update(mobjects, all_excluded)
         return list(mobjects)
 
-    def _encode_vmobject(self, encoder, vmob: VMobject, mvp_buffer) -> None:
-        """Encode fill and stroke draw calls for a single VMobject."""
+    def _stage_vmobject(
+        self, vmob: VMobject, pool, draw_ops: list[tuple]
+    ) -> None:
+        """Stage fill and stroke data for a VMobject into the buffer pool."""
         points = vmob.points
         if len(points) < 4:
             return
@@ -204,8 +336,8 @@ class MetalCamera:
         fill_rgba = vmob.get_fill_rgbas()
         if len(fill_rgba) > 0:
             fill_color = fill_rgba[0]
-            if fill_color[3] > 0:  # Has visible fill
-                self._encode_fill(encoder, points, fill_color, mvp_buffer)
+            if fill_color[3] > 0:
+                self._stage_fill(vmob, points, fill_color, pool, draw_ops)
 
         # --- Stroke ---
         stroke_rgba = vmob.get_stroke_rgbas()
@@ -213,76 +345,109 @@ class MetalCamera:
         if len(stroke_rgba) > 0 and stroke_width > 0:
             stroke_color = stroke_rgba[0]
             if stroke_color[3] > 0:
-                # Match Cairo's stroke width formula:
-                # cairo: ctx.set_line_width(width * cairo_line_width_multiple)
-                # where cairo_line_width_multiple = 0.01
                 scene_stroke_width = stroke_width * 0.01
-                self._encode_stroke(encoder, points, stroke_color, scene_stroke_width, mvp_buffer)
+                self._stage_stroke(
+                    vmob, points, stroke_color, scene_stroke_width, pool, draw_ops
+                )
 
-    def _encode_fill(self, encoder, points, fill_color, mvp_buffer) -> None:
-        """Encode stencil-then-cover fill for a VMobject."""
-        triangles = vmobject_to_triangles(points)
+    def _stage_fill(self, vmob, points, fill_color, pool, draw_ops) -> None:
+        """Stage stencil-then-cover fill data."""
+        # Check geometry cache
+        triangles = self._geo_cache.get_fill(vmob)
+        if triangles is None:
+            triangles = vmobject_to_triangles(points)
+            self._geo_cache.put_fill(vmob, triangles)
+
         if len(triangles) == 0:
             return
 
-        # Pack uniforms: mvp (float4x4) + color (float4)
+        # Pack uniforms: mvp (16 floats) + color (4 floats)
         color_arr = np.array(fill_color, dtype=np.float32)
-        uniforms = np.concatenate([self._mvp.flatten(), color_arr])
-        uniform_buffer = self.ctx.make_buffer(uniforms)
+        uniforms = np.empty(20, dtype=np.float32)
+        uniforms[:16] = self._mvp_flat
+        uniforms[16:20] = color_arr
 
-        vertex_buffer = self.ctx.make_buffer(triangles)
+        uniform_off = pool.stage(uniforms)
+        vertex_off = pool.stage(triangles)
         n_vertices = len(triangles)
 
-        # Pass 1: Stencil — toggle stencil bits with triangle fan
-        encoder.setRenderPipelineState_(self.ctx._fill_stencil_pso)
-        encoder.setDepthStencilState_(self.ctx._stencil_increment_dss)
-        encoder.setStencilReferenceValue_(0)
-        encoder.setVertexBuffer_offset_atIndex_(vertex_buffer, 0, 0)
-        encoder.setVertexBuffer_offset_atIndex_(uniform_buffer, 0, 1)
-        encoder.drawPrimitives_vertexStart_vertexCount_(
-            Metal.MTLPrimitiveTypeTriangle,
-            0,
-            n_vertices,
+        # Fill stencil pass
+        draw_ops.append(
+            (_OP_FILL_STENCIL, vertex_off, n_vertices, uniform_off)
         )
 
-        # Pass 2: Cover — draw bounding quad where stencil != 0
+        # Fill cover pass — bounding quad
         bbox = self._bounding_quad(points)
-        bbox_buffer = self.ctx.make_buffer(bbox)
-        encoder.setRenderPipelineState_(self.ctx._fill_cover_pso)
-        encoder.setDepthStencilState_(self.ctx._stencil_nonzero_dss)
-        encoder.setStencilReferenceValue_(0)
-        encoder.setVertexBuffer_offset_atIndex_(bbox_buffer, 0, 0)
-        encoder.setVertexBuffer_offset_atIndex_(uniform_buffer, 0, 1)
-        encoder.setFragmentBuffer_offset_atIndex_(uniform_buffer, 0, 1)
-        encoder.drawPrimitives_vertexStart_vertexCount_(
-            Metal.MTLPrimitiveTypeTriangle,
-            0,
-            6,
-        )
+        bbox_off = pool.stage(bbox)
+        draw_ops.append((_OP_FILL_COVER, bbox_off, uniform_off))
 
-    def _encode_stroke(self, encoder, points, stroke_color, stroke_width, mvp_buffer) -> None:
-        """Encode stroke quads for a VMobject."""
-        quads = vmobject_to_stroke_quads(points, stroke_width)
+    def _stage_stroke(
+        self, vmob, points, stroke_color, stroke_width, pool, draw_ops
+    ) -> None:
+        """Stage stroke quad data."""
+        # Check geometry cache
+        quads = self._geo_cache.get_stroke(vmob, stroke_width)
+        if quads is None:
+            quads = vmobject_to_stroke_quads(points, stroke_width)
+            self._geo_cache.put_stroke(vmob, stroke_width, quads)
+
         if len(quads) == 0:
             return
 
+        # Pack uniforms
         color_arr = np.array(stroke_color, dtype=np.float32)
-        uniforms = np.concatenate([self._mvp.flatten(), color_arr])
-        uniform_buffer = self.ctx.make_buffer(uniforms)
+        uniforms = np.empty(20, dtype=np.float32)
+        uniforms[:16] = self._mvp_flat
+        uniforms[16:20] = color_arr
 
-        vertex_buffer = self.ctx.make_buffer(quads)
+        uniform_off = pool.stage(uniforms)
+        vertex_off = pool.stage(quads)
         n_vertices = len(quads)
 
-        encoder.setRenderPipelineState_(self.ctx._stroke_pso)
-        encoder.setDepthStencilState_(self.ctx._stencil_disabled_dss)
-        encoder.setVertexBuffer_offset_atIndex_(vertex_buffer, 0, 0)
-        encoder.setVertexBuffer_offset_atIndex_(uniform_buffer, 0, 1)
-        encoder.setFragmentBuffer_offset_atIndex_(uniform_buffer, 0, 1)
-        encoder.drawPrimitives_vertexStart_vertexCount_(
-            Metal.MTLPrimitiveTypeTriangle,
-            0,
-            n_vertices,
-        )
+        draw_ops.append((_OP_STROKE, vertex_off, n_vertices, uniform_off))
+
+    # ------------------------------------------------------------------
+    # Internal helpers — Pass 2: encoding
+    # ------------------------------------------------------------------
+
+    def _execute_draw_op(self, tracker, encoder, buf, op) -> None:
+        """Dispatch a single draw operation."""
+        kind = op[0]
+        if kind == _OP_FILL_STENCIL:
+            _, vert_off, vert_count, uni_off = op
+            tracker.set_pipeline(self.ctx._fill_stencil_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_increment_dss)
+            tracker.set_stencil_ref(0)
+            encoder.setVertexBuffer_offset_atIndex_(buf, vert_off, 0)
+            encoder.setVertexBuffer_offset_atIndex_(buf, uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
+        elif kind == _OP_FILL_COVER:
+            _, bbox_off, uni_off = op
+            tracker.set_pipeline(self.ctx._fill_cover_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_nonzero_dss)
+            tracker.set_stencil_ref(0)
+            encoder.setVertexBuffer_offset_atIndex_(buf, bbox_off, 0)
+            encoder.setVertexBuffer_offset_atIndex_(buf, uni_off, 1)
+            encoder.setFragmentBuffer_offset_atIndex_(buf, uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, 6
+            )
+        elif kind == _OP_STROKE:
+            _, vert_off, vert_count, uni_off = op
+            tracker.set_pipeline(self.ctx._stroke_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_disabled_dss)
+            encoder.setVertexBuffer_offset_atIndex_(buf, vert_off, 0)
+            encoder.setVertexBuffer_offset_atIndex_(buf, uni_off, 1)
+            encoder.setFragmentBuffer_offset_atIndex_(buf, uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
 
     def _bounding_quad(self, points) -> np.ndarray:
         """Compute an axis-aligned bounding quad (2 triangles) from VMobject points."""
