@@ -9,28 +9,41 @@
 using namespace metal;
 
 struct Uniforms {
-    float4x4 mvp;
-    float4 color; // RGBA fill color, premultiplied alpha
-};
-
-struct VertexIn {
-    float2 position [[attribute(0)]];
+    float4x4 mvp;           // 64B — orthographic MVP for 2D
+    float4   color;          // 16B — RGBA fill color, premultiplied alpha
+    float3x3 rotation;       // 48B — camera rotation matrix (3D)
+    float3   frame_center;   // 12B + 4B pad
+    float2   frame_shape;    // 8B
+    float    focal_distance; // 4B
+    float    zoom;           // 4B
+    uint     is_3d;          // 4B (0 = use mvp path, 1 = use camera path)
 };
 
 struct VertexOut {
     float4 position [[position]];
 };
 
+// Shared helper: transform a 3D position using the appropriate path.
+static inline float4 transform_position(float3 pos, constant Uniforms& u) {
+    if (u.is_3d) {
+        float3 rotated = u.rotation * (pos - u.frame_center);
+        float factor = u.focal_distance / (u.focal_distance - rotated.z);
+        float2 ndc = rotated.xy * factor * u.zoom * (2.0 / u.frame_shape);
+        return float4(ndc, 0.5 - rotated.z * 0.001, 1.0);
+    } else {
+        return u.mvp * float4(pos, 1.0);
+    }
+}
+
 // ---- Pass 1: Stencil pass (triangle fan geometry) ----
 
 vertex VertexOut fill_stencil_vertex(
-    const device float2* vertices [[buffer(0)]],
+    const device packed_float3* vertices [[buffer(0)]],
     constant Uniforms& uniforms [[buffer(1)]],
     uint vid [[vertex_id]]
 ) {
     VertexOut out;
-    float2 pos = vertices[vid];
-    out.position = uniforms.mvp * float4(pos, 0.0, 1.0);
+    out.position = transform_position(vertices[vid], uniforms);
     return out;
 }
 
@@ -43,13 +56,12 @@ fragment half4 fill_stencil_fragment(VertexOut in [[stage_in]]) {
 // ---- Pass 2: Cover pass (full-screen quad or bounding quad) ----
 
 vertex VertexOut fill_cover_vertex(
-    const device float2* vertices [[buffer(0)]],
+    const device packed_float3* vertices [[buffer(0)]],
     constant Uniforms& uniforms [[buffer(1)]],
     uint vid [[vertex_id]]
 ) {
     VertexOut out;
-    float2 pos = vertices[vid];
-    out.position = uniforms.mvp * float4(pos, 0.0, 1.0);
+    out.position = transform_position(vertices[vid], uniforms);
     return out;
 }
 

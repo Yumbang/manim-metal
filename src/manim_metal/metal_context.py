@@ -110,8 +110,6 @@ class MetalContext:
         Render target height in pixels.
     """
 
-    MSAA_SAMPLE_COUNT = 4
-
     def __init__(self, width: int, height: int) -> None:
         self.width = width
         self.height = height
@@ -120,16 +118,24 @@ class MetalContext:
         self.device = Metal.MTLCreateSystemDefaultDevice()
         if self.device is None:
             raise RuntimeError("No Metal-compatible GPU found")
+
+        # Use highest supported MSAA sample count
+        self.msaa_sample_count = 1
+        for count in (8, 4, 2):
+            if self.device.supportsTextureSampleCount_(count):
+                self.msaa_sample_count = count
+                break
         self.command_queue = self.device.newCommandQueue()
 
         # Compile shader libraries
         self._libraries: dict[str, Metal.MTLLibrary] = {}
         self._compile_shaders()
 
-        # Create render targets (MSAA + resolve)
+        # Create render targets (MSAA + resolve + depth)
         self._create_render_target()
         self._create_msaa_target()
         self._create_stencil_target()
+        self._create_depth_target()
 
         # Create pipeline states
         self._fill_stencil_pso = self._make_fill_stencil_pipeline()
@@ -143,6 +149,21 @@ class MetalContext:
 
         # Buffer pool for sub-allocation
         self.buffer_pool = BufferPool(self.device)
+
+        # Readback via shared MTLBuffer — GPU blits texture → buffer,
+        # then numpy maps the buffer directly (zero-copy on UMA).
+        readback_size = width * height * 4
+        self._readback_mtl_buf = self.device.newBufferWithLength_options_(
+            readback_size, Metal.MTLResourceStorageModeShared
+        )
+        # numpy holds a reference to the memoryview, keeping it alive.
+        # We don't store the memoryview as an attribute because Manim's
+        # hashing system traverses camera→ctx attributes and memoryview
+        # is unhashable.
+        self._readback_numpy = np.frombuffer(
+            self._readback_mtl_buf.contents().as_buffer(readback_size),
+            dtype=np.uint8,
+        ).reshape(height, width, 4)
 
     # ------------------------------------------------------------------
     # Shader compilation
@@ -172,7 +193,7 @@ class MetalContext:
         """Non-MSAA resolve target (CPU-readable for readback)."""
         make_tex = Metal.MTLTextureDescriptor
         desc = make_tex.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-            Metal.MTLPixelFormatBGRA8Unorm,
+            Metal.MTLPixelFormatRGBA8Unorm,
             self.width,
             self.height,
             False,
@@ -185,10 +206,10 @@ class MetalContext:
         """4x MSAA color texture — rendering goes here, then resolves to render_target."""
         desc = Metal.MTLTextureDescriptor.alloc().init()
         desc.setTextureType_(Metal.MTLTextureType2DMultisample)
-        desc.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+        desc.setPixelFormat_(Metal.MTLPixelFormatRGBA8Unorm)
         desc.setWidth_(self.width)
         desc.setHeight_(self.height)
-        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
+        desc.setSampleCount_(self.msaa_sample_count)
         desc.setUsage_(Metal.MTLTextureUsageRenderTarget)
         desc.setStorageMode_(Metal.MTLStorageModePrivate)
         self.msaa_target = self.device.newTextureWithDescriptor_(desc)
@@ -200,10 +221,22 @@ class MetalContext:
         desc.setPixelFormat_(Metal.MTLPixelFormatStencil8)
         desc.setWidth_(self.width)
         desc.setHeight_(self.height)
-        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
+        desc.setSampleCount_(self.msaa_sample_count)
         desc.setUsage_(Metal.MTLTextureUsageRenderTarget)
         desc.setStorageMode_(Metal.MTLStorageModePrivate)
         self.stencil_target = self.device.newTextureWithDescriptor_(desc)
+
+    def _create_depth_target(self) -> None:
+        """MSAA depth texture for 3D depth testing (must match MSAA sample count)."""
+        desc = Metal.MTLTextureDescriptor.alloc().init()
+        desc.setTextureType_(Metal.MTLTextureType2DMultisample)
+        desc.setPixelFormat_(Metal.MTLPixelFormatDepth32Float)
+        desc.setWidth_(self.width)
+        desc.setHeight_(self.height)
+        desc.setSampleCount_(self.msaa_sample_count)
+        desc.setUsage_(Metal.MTLTextureUsageRenderTarget)
+        desc.setStorageMode_(Metal.MTLStorageModePrivate)
+        self.depth_target = self.device.newTextureWithDescriptor_(desc)
 
     # ------------------------------------------------------------------
     # Pipeline states
@@ -211,17 +244,18 @@ class MetalContext:
 
     def _make_fill_stencil_pipeline(self):
         desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
-        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
+        desc.setSampleCount_(self.msaa_sample_count)
         desc.setVertexFunction_(self._get_function("fill", "fill_stencil_vertex"))
         desc.setFragmentFunction_(self._get_function("fill", "fill_stencil_fragment"))
         desc.colorAttachments().objectAtIndexedSubscript_(0).setPixelFormat_(
-            Metal.MTLPixelFormatBGRA8Unorm
+            Metal.MTLPixelFormatRGBA8Unorm
         )
         # Disable color writes for stencil pass
         desc.colorAttachments().objectAtIndexedSubscript_(0).setWriteMask_(
             Metal.MTLColorWriteMaskNone
         )
         desc.setStencilAttachmentPixelFormat_(Metal.MTLPixelFormatStencil8)
+        desc.setDepthAttachmentPixelFormat_(Metal.MTLPixelFormatDepth32Float)
         pso, error = self.device.newRenderPipelineStateWithDescriptor_error_(desc, None)
         if error is not None:
             raise RuntimeError(f"Fill stencil pipeline creation failed: {error}")
@@ -229,11 +263,11 @@ class MetalContext:
 
     def _make_fill_cover_pipeline(self):
         desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
-        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
+        desc.setSampleCount_(self.msaa_sample_count)
         desc.setVertexFunction_(self._get_function("fill", "fill_cover_vertex"))
         desc.setFragmentFunction_(self._get_function("fill", "fill_cover_fragment"))
         ca = desc.colorAttachments().objectAtIndexedSubscript_(0)
-        ca.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+        ca.setPixelFormat_(Metal.MTLPixelFormatRGBA8Unorm)
         # Enable alpha blending
         ca.setBlendingEnabled_(True)
         ca.setSourceRGBBlendFactor_(Metal.MTLBlendFactorSourceAlpha)
@@ -241,6 +275,7 @@ class MetalContext:
         ca.setSourceAlphaBlendFactor_(Metal.MTLBlendFactorOne)
         ca.setDestinationAlphaBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
         desc.setStencilAttachmentPixelFormat_(Metal.MTLPixelFormatStencil8)
+        desc.setDepthAttachmentPixelFormat_(Metal.MTLPixelFormatDepth32Float)
         pso, error = self.device.newRenderPipelineStateWithDescriptor_error_(desc, None)
         if error is not None:
             raise RuntimeError(f"Fill cover pipeline creation failed: {error}")
@@ -248,17 +283,18 @@ class MetalContext:
 
     def _make_stroke_pipeline(self):
         desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
-        desc.setSampleCount_(self.MSAA_SAMPLE_COUNT)
+        desc.setSampleCount_(self.msaa_sample_count)
         desc.setVertexFunction_(self._get_function("stroke", "stroke_vertex"))
         desc.setFragmentFunction_(self._get_function("stroke", "stroke_fragment"))
         ca = desc.colorAttachments().objectAtIndexedSubscript_(0)
-        ca.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+        ca.setPixelFormat_(Metal.MTLPixelFormatRGBA8Unorm)
         ca.setBlendingEnabled_(True)
         ca.setSourceRGBBlendFactor_(Metal.MTLBlendFactorSourceAlpha)
         ca.setDestinationRGBBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
         ca.setSourceAlphaBlendFactor_(Metal.MTLBlendFactorOne)
         ca.setDestinationAlphaBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
         desc.setStencilAttachmentPixelFormat_(Metal.MTLPixelFormatStencil8)
+        desc.setDepthAttachmentPixelFormat_(Metal.MTLPixelFormatDepth32Float)
         pso, error = self.device.newRenderPipelineStateWithDescriptor_error_(desc, None)
         if error is not None:
             raise RuntimeError(f"Stroke pipeline creation failed: {error}")
@@ -269,8 +305,15 @@ class MetalContext:
     # ------------------------------------------------------------------
 
     def _make_stencil_increment_state(self):
-        """DSS for stencil pass: always pass, invert stencil on both front/back."""
+        """DSS for stencil pass: always pass stencil, invert on both faces.
+
+        Depth test: less-or-equal (enabled), depth write: OFF.
+        LessEqual ensures 2D objects at z=0 can overdraw each other
+        (important since Cairo-path objects are drawn back-to-front by z_index).
+        """
         desc = Metal.MTLDepthStencilDescriptor.alloc().init()
+        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
+        desc.setDepthWriteEnabled_(False)
         stencil_desc = Metal.MTLStencilDescriptor.alloc().init()
         stencil_desc.setStencilCompareFunction_(Metal.MTLCompareFunctionAlways)
         stencil_desc.setDepthStencilPassOperation_(Metal.MTLStencilOperationInvert)
@@ -283,8 +326,14 @@ class MetalContext:
         return self.device.newDepthStencilStateWithDescriptor_(desc)
 
     def _make_stencil_nonzero_state(self):
-        """DSS for cover pass: pass where stencil != 0, then reset to 0."""
+        """DSS for cover pass: pass where stencil != 0, then reset to 0.
+
+        Depth test: less-or-equal (enabled), depth write: ON.
+        Cover pass writes depth so subsequent objects behind this one are occluded.
+        """
         desc = Metal.MTLDepthStencilDescriptor.alloc().init()
+        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
+        desc.setDepthWriteEnabled_(True)
         stencil_desc = Metal.MTLStencilDescriptor.alloc().init()
         stencil_desc.setStencilCompareFunction_(Metal.MTLCompareFunctionNotEqual)
         stencil_desc.setDepthStencilPassOperation_(Metal.MTLStencilOperationZero)
@@ -297,8 +346,13 @@ class MetalContext:
         return self.device.newDepthStencilStateWithDescriptor_(desc)
 
     def _make_stencil_disabled_state(self):
-        """DSS with stencil test disabled (for stroke rendering)."""
+        """DSS for stroke rendering: stencil disabled, depth test enabled.
+
+        Depth test: less-or-equal, depth write: ON.
+        """
         desc = Metal.MTLDepthStencilDescriptor.alloc().init()
+        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
+        desc.setDepthWriteEnabled_(True)
         return self.device.newDepthStencilStateWithDescriptor_(desc)
 
     # ------------------------------------------------------------------
@@ -339,6 +393,16 @@ class MetalContext:
             sa.setLoadAction_(Metal.MTLLoadActionLoad)
         sa.setStoreAction_(Metal.MTLStoreActionDontCare)
 
+        # Depth attachment
+        da = rpd.depthAttachment()
+        da.setTexture_(self.depth_target)
+        if clear:
+            da.setLoadAction_(Metal.MTLLoadActionClear)
+            da.setClearDepth_(1.0)
+        else:
+            da.setLoadAction_(Metal.MTLLoadActionLoad)
+        da.setStoreAction_(Metal.MTLStoreActionDontCare)
+
         return rpd
 
     def make_buffer(self, data: npt.NDArray) -> Metal.MTLBuffer:
@@ -350,28 +414,58 @@ class MetalContext:
             Metal.MTLResourceStorageModeShared,
         )
 
-    def render_texture_to_numpy(self) -> npt.NDArray[np.uint8]:
+    def blit_texture_to_readback(self, cmd) -> None:
+        """Append a blit encoder to *cmd* that copies the resolved texture to the readback buffer.
+
+        The GPU handles untiling — much faster than CPU-side ``getBytes`` on
+        Apple Silicon's unified memory.  Call this after the render encoder
+        ends but before ``cmd.commit()``.
+        """
+        blit = cmd.blitCommandEncoder()
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_(
+            self.render_target,
+            0,
+            0,
+            Metal.MTLOriginMake(0, 0, 0),
+            Metal.MTLSizeMake(self.width, self.height, 1),
+            self._readback_mtl_buf,
+            0,
+            self.width * 4,
+            self.width * self.height * 4,
+        )
+        blit.endEncoding()
+
+    def render_texture_to_numpy(
+        self, target: npt.NDArray[np.uint8] | None = None
+    ) -> npt.NDArray[np.uint8]:
         """Read the render target into a NumPy RGBA array.
+
+        Uses GPU blit to convert the tiled texture into a linear shared buffer,
+        then maps the buffer directly into numpy (zero-copy on Apple Silicon UMA).
+
+        Parameters
+        ----------
+        target
+            If provided, the texture is read directly into this array
+            (must be contiguous, shape (height, width, 4), dtype uint8).
+            If ``None``, a new array is returned.
 
         Returns
         -------
         np.ndarray
             Shape (height, width, 4), dtype uint8, RGBA order.
         """
-        w = self.width
-        h = self.height
-        bytes_per_row = w * 4
+        # GPU blit: texture (tiled) → shared buffer (linear)
+        cmd = self.command_queue.commandBuffer()
+        self.blit_texture_to_readback(cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
 
-        buf = bytearray(h * bytes_per_row)
-        region = Metal.MTLRegionMake2D(0, 0, w, h)
-        self.render_target.getBytes_bytesPerRow_fromRegion_mipmapLevel_(
-            buf, bytes_per_row, region, 0
-        )
+        if target is not None:
+            np.copyto(target, self._readback_numpy)
+            return target
 
-        # BGRA -> RGBA
-        arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4).copy()
-        arr[:, :, [0, 2]] = arr[:, :, [2, 0]]
-        return arr
+        return self._readback_numpy.copy()
 
     def clear_render_target(self, color: tuple[float, float, float, float]) -> None:
         """Clear the render target to the given RGBA color."""

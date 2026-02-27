@@ -1,9 +1,11 @@
 """Monkey-patches manim to support the Metal renderer.
 
-Patches three things at import time:
+Patches at import time:
 1. Adds METAL member to RendererType enum
 2. The ManimConfig.renderer setter already works once the enum is extended
 3. Wraps Scene.__init__ to instantiate MetalRenderer when config.renderer == "metal"
+4. Patches Scene methods that assert config.renderer == CAIRO
+5. Patches ThreeDScene methods that branch on RendererType to accept METAL
 """
 
 from __future__ import annotations
@@ -84,6 +86,58 @@ def _patch_scene_cairo_assertions() -> None:
         setattr(Scene, method_name, patched)
 
 
+def _patch_three_d_scene() -> None:
+    """Patch ThreeDScene methods that branch on RendererType to accept METAL.
+
+    ThreeDScene methods like ``move_camera``, ``begin_ambient_camera_rotation``,
+    ``stop_ambient_camera_rotation``, ``add_fixed_in_frame_mobjects``,
+    ``add_fixed_orientation_mobjects``, etc. check
+    ``config.renderer == RendererType.CAIRO`` to decide which code path to take.
+    Metal should take the CAIRO path since it uses the same VMobject classes.
+
+    We temporarily swap config.renderer to CAIRO during these calls.
+    """
+    from manim import config
+    from manim.constants import RendererType
+
+    try:
+        from manim.scene.three_d_scene import ThreeDScene
+    except ImportError:
+        return  # ThreeDScene not available
+
+    methods_to_patch = (
+        "move_camera",
+        "begin_ambient_camera_rotation",
+        "stop_ambient_camera_rotation",
+        "begin_3dillusion_camera_rotation",
+        "stop_3dillusion_camera_rotation",
+        "set_camera_orientation",
+        "add_fixed_in_frame_mobjects",
+        "add_fixed_orientation_mobjects",
+        "remove_fixed_in_frame_mobjects",
+        "remove_fixed_orientation_mobjects",
+        "get_moving_mobjects",
+    )
+
+    for method_name in methods_to_patch:
+        original = getattr(ThreeDScene, method_name, None)
+        if original is None:
+            continue
+
+        @functools.wraps(original)
+        def patched(self, *args, _orig=original, **kwargs):
+            should_swap = config.renderer == RendererType.METAL
+            if should_swap:
+                config._d["renderer"] = RendererType.CAIRO
+            try:
+                return _orig(self, *args, **kwargs)
+            finally:
+                if should_swap:
+                    config._d["renderer"] = RendererType.METAL
+
+        setattr(ThreeDScene, method_name, patched)
+
+
 def apply_patches() -> None:
     """Apply all monkey-patches. Safe to call multiple times."""
     global _patched
@@ -92,4 +146,5 @@ def apply_patches() -> None:
     _extend_renderer_type_enum()
     _patch_scene_init()
     _patch_scene_cairo_assertions()
+    _patch_three_d_scene()
     _patched = True
