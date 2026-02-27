@@ -213,8 +213,10 @@ class MetalCamera:
         if len(stroke_rgba) > 0 and stroke_width > 0:
             stroke_color = stroke_rgba[0]
             if stroke_color[3] > 0:
-                # Convert stroke width from pixels to scene units
-                scene_stroke_width = stroke_width * self.frame_width / self.pixel_width
+                # Match Cairo's stroke width formula:
+                # cairo: ctx.set_line_width(width * cairo_line_width_multiple)
+                # where cairo_line_width_multiple = 0.01
+                scene_stroke_width = stroke_width * 0.01
                 self._encode_stroke(encoder, points, stroke_color, scene_stroke_width, mvp_buffer)
 
     def _encode_fill(self, encoder, points, fill_color, mvp_buffer) -> None:
@@ -238,7 +240,7 @@ class MetalCamera:
         encoder.setVertexBuffer_offset_atIndex_(vertex_buffer, 0, 0)
         encoder.setVertexBuffer_offset_atIndex_(uniform_buffer, 0, 1)
         encoder.drawPrimitives_vertexStart_vertexCount_(
-            0,  # MTLPrimitiveTypeTriangle
+            Metal.MTLPrimitiveTypeTriangle,
             0,
             n_vertices,
         )
@@ -253,7 +255,7 @@ class MetalCamera:
         encoder.setVertexBuffer_offset_atIndex_(uniform_buffer, 0, 1)
         encoder.setFragmentBuffer_offset_atIndex_(uniform_buffer, 0, 1)
         encoder.drawPrimitives_vertexStart_vertexCount_(
-            0,  # MTLPrimitiveTypeTriangle
+            Metal.MTLPrimitiveTypeTriangle,
             0,
             6,
         )
@@ -277,7 +279,7 @@ class MetalCamera:
         encoder.setVertexBuffer_offset_atIndex_(uniform_buffer, 0, 1)
         encoder.setFragmentBuffer_offset_atIndex_(uniform_buffer, 0, 1)
         encoder.drawPrimitives_vertexStart_vertexCount_(
-            0,  # MTLPrimitiveTypeTriangle
+            Metal.MTLPrimitiveTypeTriangle,
             0,
             n_vertices,
         )
