@@ -138,6 +138,71 @@ def _patch_three_d_scene() -> None:
         setattr(ThreeDScene, method_name, patched)
 
 
+def _patch_three_d_mobjects() -> None:
+    """Patch 3D mobject methods that branch on RendererType.
+
+    Many 3D classes check config.renderer to choose resolution defaults or
+    code paths, and either raise or leave variables undefined for unknown
+    renderers.  Metal should always take the Cairo path.
+
+    Affected: Sphere.__init__, Torus.__init__, Cylinder.add_bases,
+    Surface.set_fill_by_value, ThreeDAxes.__init__, ThreeDAxes.plot_surface.
+    """
+    from manim import config
+    from manim.constants import RendererType
+
+    def _make_swap_wrapper(original):
+        """Create a wrapper that temporarily swaps METAL→CAIRO."""
+
+        @functools.wraps(original)
+        def wrapper(*args, **kwargs):
+            should_swap = config.renderer == RendererType.METAL
+            if should_swap:
+                config._d["renderer"] = RendererType.CAIRO
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if should_swap:
+                    config._d["renderer"] = RendererType.METAL
+
+        return wrapper
+
+    # (class, method_name) pairs to patch
+    targets = []
+
+    try:
+        from manim.mobject.three_d.three_dimensions import (
+            Cylinder,
+            Sphere,
+            Surface,
+            Torus,
+        )
+
+        targets += [
+            (Sphere, "__init__"),
+            (Torus, "__init__"),
+            (Cylinder, "add_bases"),
+            (Surface, "set_fill_by_value"),
+        ]
+    except ImportError:
+        pass
+
+    try:
+        from manim.mobject.graphing.coordinate_systems import ThreeDAxes
+
+        targets += [
+            (ThreeDAxes, "__init__"),
+            (ThreeDAxes, "plot_surface"),
+        ]
+    except ImportError:
+        pass
+
+    for cls, method_name in targets:
+        original = getattr(cls, method_name, None)
+        if original is not None:
+            setattr(cls, method_name, _make_swap_wrapper(original))
+
+
 def apply_patches() -> None:
     """Apply all monkey-patches. Safe to call multiple times."""
     global _patched
@@ -147,4 +212,5 @@ def apply_patches() -> None:
     _patch_scene_init()
     _patch_scene_cairo_assertions()
     _patch_three_d_scene()
+    _patch_three_d_mobjects()
     _patched = True
