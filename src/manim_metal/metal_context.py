@@ -68,9 +68,7 @@ class BufferPool:
         offset = self._offset
 
         # Advance with 256-byte alignment
-        self._offset = (self._offset + size + _BUFFER_ALIGNMENT - 1) & ~(
-            _BUFFER_ALIGNMENT - 1
-        )
+        self._offset = (self._offset + size + _BUFFER_ALIGNMENT - 1) & ~(_BUFFER_ALIGNMENT - 1)
         return offset
 
     def finalize(self):
@@ -137,10 +135,14 @@ class MetalContext:
         self._create_stencil_target()
         self._create_depth_target()
 
-        # Create pipeline states
+        # Create pipeline states (unlit)
         self._fill_stencil_pso = self._make_fill_stencil_pipeline()
         self._fill_cover_pso = self._make_fill_cover_pipeline()
         self._stroke_pso = self._make_stroke_pipeline()
+
+        # Create lit pipeline states (Blinn-Phong, Phase 2)
+        self._fill_cover_lit_pso = self._make_fill_cover_lit_pipeline()
+        self._stroke_lit_pso = self._make_stroke_lit_pipeline()
 
         # Depth-stencil states
         self._stencil_increment_dss = self._make_stencil_increment_state()
@@ -170,9 +172,20 @@ class MetalContext:
     # ------------------------------------------------------------------
 
     def _compile_shaders(self) -> None:
+        # Read lighting.h once — it is prepended to fill.metal and stroke.metal
+        # so that lit shader variants (fill_cover_lit_*, stroke_lit_*) have
+        # access to the shared Uniforms struct and helper functions.
+        # The #ifndef MANIM_METAL_LIGHTING_H guard in each .metal file ensures
+        # the inlined fallback definitions are skipped when the header is present.
+        lighting_h_path = _SHADER_DIR / "lighting.h"
+        lighting_h_src = lighting_h_path.read_text() if lighting_h_path.exists() else ""
+
         for name in ("fill", "stroke", "blit"):
             src_path = _SHADER_DIR / f"{name}.metal"
             source = src_path.read_text()
+            # Prepend lighting.h to fill and stroke (not blit)
+            if lighting_h_src and name in ("fill", "stroke"):
+                source = lighting_h_src + "\n" + source
             library, error = self.device.newLibraryWithSource_options_error_(source, None, None)
             if error is not None:
                 raise RuntimeError(f"Failed to compile {name}.metal: {error}")
@@ -301,18 +314,73 @@ class MetalContext:
         return pso
 
     # ------------------------------------------------------------------
+    # Lit pipeline states (Phase 2: Blinn-Phong lighting)
+    # ------------------------------------------------------------------
+
+    def _make_fill_cover_lit_pipeline(self):
+        """Pipeline for the lit cover pass (Blinn-Phong shaded fills).
+
+        Same configuration as the unlit cover pipeline but uses the
+        ``fill_cover_lit_vertex`` / ``fill_cover_lit_fragment`` shader functions
+        which read LitVertex buffers (24B per vertex: position + normal).
+        """
+        desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
+        desc.setSampleCount_(self.msaa_sample_count)
+        desc.setVertexFunction_(self._get_function("fill", "fill_cover_lit_vertex"))
+        desc.setFragmentFunction_(self._get_function("fill", "fill_cover_lit_fragment"))
+        ca = desc.colorAttachments().objectAtIndexedSubscript_(0)
+        ca.setPixelFormat_(Metal.MTLPixelFormatRGBA8Unorm)
+        # Enable alpha blending (same as unlit cover)
+        ca.setBlendingEnabled_(True)
+        ca.setSourceRGBBlendFactor_(Metal.MTLBlendFactorSourceAlpha)
+        ca.setDestinationRGBBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
+        ca.setSourceAlphaBlendFactor_(Metal.MTLBlendFactorOne)
+        ca.setDestinationAlphaBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
+        desc.setStencilAttachmentPixelFormat_(Metal.MTLPixelFormatStencil8)
+        desc.setDepthAttachmentPixelFormat_(Metal.MTLPixelFormatDepth32Float)
+        pso, error = self.device.newRenderPipelineStateWithDescriptor_error_(desc, None)
+        if error is not None:
+            raise RuntimeError(f"Fill cover lit pipeline creation failed: {error}")
+        return pso
+
+    def _make_stroke_lit_pipeline(self):
+        """Pipeline for the lit stroke pass (Blinn-Phong shaded strokes).
+
+        Same configuration as the unlit stroke pipeline but uses the
+        ``stroke_lit_vertex`` / ``stroke_lit_fragment`` shader functions
+        which read LitVertex buffers (24B per vertex: position + normal).
+        """
+        desc = Metal.MTLRenderPipelineDescriptor.alloc().init()
+        desc.setSampleCount_(self.msaa_sample_count)
+        desc.setVertexFunction_(self._get_function("stroke", "stroke_lit_vertex"))
+        desc.setFragmentFunction_(self._get_function("stroke", "stroke_lit_fragment"))
+        ca = desc.colorAttachments().objectAtIndexedSubscript_(0)
+        ca.setPixelFormat_(Metal.MTLPixelFormatRGBA8Unorm)
+        ca.setBlendingEnabled_(True)
+        ca.setSourceRGBBlendFactor_(Metal.MTLBlendFactorSourceAlpha)
+        ca.setDestinationRGBBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
+        ca.setSourceAlphaBlendFactor_(Metal.MTLBlendFactorOne)
+        ca.setDestinationAlphaBlendFactor_(Metal.MTLBlendFactorOneMinusSourceAlpha)
+        desc.setStencilAttachmentPixelFormat_(Metal.MTLPixelFormatStencil8)
+        desc.setDepthAttachmentPixelFormat_(Metal.MTLPixelFormatDepth32Float)
+        pso, error = self.device.newRenderPipelineStateWithDescriptor_error_(desc, None)
+        if error is not None:
+            raise RuntimeError(f"Stroke lit pipeline creation failed: {error}")
+        return pso
+
+    # ------------------------------------------------------------------
     # Depth-stencil states
     # ------------------------------------------------------------------
 
     def _make_stencil_increment_state(self):
         """DSS for stencil pass: always pass stencil, invert on both faces.
 
-        Depth test: less-or-equal (enabled), depth write: OFF.
-        LessEqual ensures 2D objects at z=0 can overdraw each other
-        (important since Cairo-path objects are drawn back-to-front by z_index).
+        Depth test: always pass (disabled). The stencil-mark pass must ignore
+        depth so that adjacent Surface patches can always set stencil values
+        correctly. Depth ordering is handled by the subsequent fill pass.
         """
         desc = Metal.MTLDepthStencilDescriptor.alloc().init()
-        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
+        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionAlways)
         desc.setDepthWriteEnabled_(False)
         stencil_desc = Metal.MTLStencilDescriptor.alloc().init()
         stencil_desc.setStencilCompareFunction_(Metal.MTLCompareFunctionAlways)
@@ -328,8 +396,14 @@ class MetalContext:
     def _make_stencil_nonzero_state(self):
         """DSS for cover pass: pass where stencil != 0, then reset to 0.
 
-        Depth test: less-or-equal (enabled), depth write: ON.
-        Cover pass writes depth so subsequent objects behind this one are occluded.
+        Draws the fill geometry (same triangles as stencil pass) with per-pixel
+        depth from the actual geometry. This avoids the flat bounding-quad depth
+        that caused gaps between adjacent Surface patches.
+
+        Depth test: LessEqual — correct inter-object occlusion.
+        Depth write: ON — so subsequent objects are properly occluded.
+        On depth failure, stencil is still zeroed (depthFailure=Zero) so
+        stencil stays clean for subsequent objects.
         """
         desc = Metal.MTLDepthStencilDescriptor.alloc().init()
         desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
@@ -338,7 +412,7 @@ class MetalContext:
         stencil_desc.setStencilCompareFunction_(Metal.MTLCompareFunctionNotEqual)
         stencil_desc.setDepthStencilPassOperation_(Metal.MTLStencilOperationZero)
         stencil_desc.setStencilFailureOperation_(Metal.MTLStencilOperationKeep)
-        stencil_desc.setDepthFailureOperation_(Metal.MTLStencilOperationKeep)
+        stencil_desc.setDepthFailureOperation_(Metal.MTLStencilOperationZero)
         stencil_desc.setReadMask_(0xFF)
         stencil_desc.setWriteMask_(0xFF)
         desc.setFrontFaceStencil_(stencil_desc)

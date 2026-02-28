@@ -130,13 +130,25 @@ def test_3d_geometry_tessellation():
     points = np.array(
         [
             # Curve 1: bottom edge
-            [-1, -1, 0], [-0.5, -1, 0], [0.5, -1, 0], [1, -1, 0],
+            [-1, -1, 0],
+            [-0.5, -1, 0],
+            [0.5, -1, 0],
+            [1, -1, 0],
             # Curve 2: right edge
-            [1, -1, 0], [1, -0.5, 0], [1, 0.5, 0], [1, 1, 0],
+            [1, -1, 0],
+            [1, -0.5, 0],
+            [1, 0.5, 0],
+            [1, 1, 0],
             # Curve 3: top edge
-            [1, 1, 0], [0.5, 1, 0], [-0.5, 1, 0], [-1, 1, 0],
+            [1, 1, 0],
+            [0.5, 1, 0],
+            [-0.5, 1, 0],
+            [-1, 1, 0],
             # Curve 4: left edge
-            [-1, 1, 0], [-1, 0.5, 0], [-1, -0.5, 0], [-1, -1, 0],
+            [-1, 1, 0],
+            [-1, 0.5, 0],
+            [-1, -0.5, 0],
+            [-1, -1, 0],
         ],
         dtype=np.float64,
     )
@@ -157,10 +169,22 @@ def test_3d_geometry_preserves_z():
     # Square at z=2.0
     points = np.array(
         [
-            [-1, -1, 2], [-0.5, -1, 2], [0.5, -1, 2], [1, -1, 2],
-            [1, -1, 2], [1, -0.5, 2], [1, 0.5, 2], [1, 1, 2],
-            [1, 1, 2], [0.5, 1, 2], [-0.5, 1, 2], [-1, 1, 2],
-            [-1, 1, 2], [-1, 0.5, 2], [-1, -0.5, 2], [-1, -1, 2],
+            [-1, -1, 2],
+            [-0.5, -1, 2],
+            [0.5, -1, 2],
+            [1, -1, 2],
+            [1, -1, 2],
+            [1, -0.5, 2],
+            [1, 0.5, 2],
+            [1, 1, 2],
+            [1, 1, 2],
+            [0.5, 1, 2],
+            [-0.5, 1, 2],
+            [-1, 1, 2],
+            [-1, 1, 2],
+            [-1, 0.5, 2],
+            [-1, -0.5, 2],
+            [-1, -1, 2],
         ],
         dtype=np.float64,
     )
@@ -168,27 +192,6 @@ def test_3d_geometry_preserves_z():
     tris = vmobject_to_triangles(points)
     # All z values should be approximately 2.0
     assert np.allclose(tris[:, 2], 2.0, atol=0.01)
-
-
-def test_bounding_quad_3d(metal_config):
-    """Bounding quad should have 3 components with centroid z."""
-    from manim_metal.metal_camera import MetalCamera
-
-    cam = MetalCamera()
-
-    # Points at z=1.5
-    points = np.array(
-        [
-            [-1, -1, 1.5],
-            [1, 1, 1.5],
-            [0, 0, 1.5],
-        ],
-        dtype=np.float64,
-    )
-
-    bbox = cam._bounding_quad(points)
-    assert bbox.shape == (6, 3)
-    assert np.allclose(bbox[:, 2], 1.5)
 
 
 def test_render_3d_circle(metal_config):

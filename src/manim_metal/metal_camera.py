@@ -20,9 +20,12 @@ from manim_metal.utils import (
     batch_tessellate,
     build_rotation_matrix,
     build_world_to_ndc_matrix,
+    compute_globally_smooth_normals,
+    compute_stroke_face_normals,
 )
 
 if TYPE_CHECKING:
+    import numpy.typing as npt
     from manim.mobject.mobject import Mobject
     from manim.typing import PixelArray
 
@@ -31,10 +34,12 @@ if TYPE_CHECKING:
 # Draw operation types for two-pass rendering
 # ---------------------------------------------------------------------------
 
-# Each draw op is a tuple: (kind, ...) where kind is one of:
-_OP_FILL_STENCIL = 0  # (kind, vert_offset, vert_count, uniform_offset)
-_OP_FILL_COVER = 1  # (kind, bbox_offset, uniform_offset)
-_OP_STROKE = 2  # (kind, vert_offset, vert_count, uniform_offset)
+# Each draw op is a tuple: (kind, vert_offset, vert_count, uniform_offset)
+_OP_FILL_STENCIL = 0  # stencil-mark pass: fan triangles, stencil invert, no color/depth write
+_OP_FILL_COVER = 1  # fill+depth pass: same triangles, color write + depth write, stencil NZ→0
+_OP_STROKE = 2  # stroke pass: stroke quads, depth test, no stencil
+_OP_FILL_COVER_LIT = 3  # lit cover pass: LitVertex buffer (pos+normal), Blinn-Phong shading
+_OP_STROKE_LIT = 4  # lit stroke pass: LitVertex buffer (pos+normal), Blinn-Phong shading
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +63,7 @@ _UNIFORM_SIZE = 256  # bytes
 _UNIFORM_FLOATS = _UNIFORM_SIZE // 4  # 64 float32s
 
 
-def _pack_uniforms_2d(
-    mvp_flat: np.ndarray, color: np.ndarray, buf: np.ndarray
-) -> None:
+def _pack_uniforms_2d(mvp_flat: np.ndarray, color: np.ndarray, buf: np.ndarray) -> None:
     """Pack 2D uniform data into the pre-allocated buffer."""
     buf[:16] = mvp_flat
     buf[16:20] = color
@@ -104,12 +107,95 @@ def _pack_uniforms_3d(
     buf[39] = np.float32(zoom)
     # is_3d flag (reinterpret as uint32 = 1)
     buf[40] = np.float32(0.0)  # placeholder — set via view below
+    # use_lighting at [41] — set via _set_use_lighting_flag
+    # Lighting params at [42..53] — set via _pack_lighting_params
 
 
 def _set_is_3d_flag(buf: np.ndarray, value: int) -> None:
     """Set the is_3d uint flag in the uniform buffer."""
     # buf is float32; we need to write a uint32 at index 40
     buf.view(np.uint32)[40] = value
+
+
+def _set_use_lighting_flag(buf: np.ndarray, value: int) -> None:
+    """Set the use_lighting uint flag in the uniform buffer."""
+    # buf is float32; we need to write a uint32 at index 41
+    buf.view(np.uint32)[41] = value
+
+
+def _needs_lighting(vmob: VMobject) -> bool:
+    """Return True if *vmob* should use the lit (Blinn-Phong) rendering path.
+
+    Criteria (any one is sufficient):
+      - Instance of a 3D surface class (Surface, Sphere, Torus, Cylinder, Cone)
+      - Has a ``shade_in_3d`` attribute set to True
+    """
+    # Check shade_in_3d attribute (set by some Manim 3D mobjects)
+    if getattr(vmob, "shade_in_3d", False):
+        return True
+
+    # Check for known 3D surface types (lazy import to avoid circular deps)
+    try:
+        from manim.mobject.three_d.three_dimensions import (
+            Cone,
+            Cylinder,
+            Sphere,
+            Surface,
+            Torus,
+        )
+
+        if isinstance(vmob, (Surface, Sphere, Torus, Cylinder, Cone)):
+            return True
+    except ImportError:
+        pass
+
+    return False
+
+
+def _interleave_pos_normal(positions: np.ndarray, normals: np.ndarray) -> np.ndarray:
+    """Interleave (N, 3) positions and (N, 3) normals into LitVertex format.
+
+    Returns an (N, 6) float32 array: [px, py, pz, nx, ny, nz] per vertex.
+    When reinterpreted as raw bytes, each vertex is 24 bytes — matching the
+    GPU-side ``LitVertex`` struct (two ``packed_float3``).
+    """
+    n = len(positions)
+    lit = np.empty((n, 6), dtype=np.float32)
+    lit[:, :3] = positions
+    lit[:, 3:] = normals
+    return lit
+
+
+def _pack_lighting_params(
+    buf: np.ndarray,
+    ambient_strength: float,
+    diffuse_strength: float,
+    light_position: np.ndarray,
+    light_color: np.ndarray,
+    specular_strength: float,
+    shininess: float,
+) -> None:
+    """Pack Blinn-Phong lighting parameters into the uniform buffer.
+
+    See lighting.h for byte offset documentation.  The buffer is a float32
+    array of 64 elements (256 bytes total).
+
+    Offsets (float32 index):
+      [42] ambient_strength
+      [43] diffuse_strength
+      [44:47] light_position (float3, pad at [47])
+      [48:51] light_color    (float3, pad at [51])
+      [52] specular_strength
+      [53] shininess
+    """
+    buf[42] = np.float32(ambient_strength)
+    buf[43] = np.float32(diffuse_strength)
+    buf[44:47] = light_position[:3].astype(np.float32)
+    # buf[47] = 0.0 — already zero from np.zeros
+    buf[48:51] = light_color[:3].astype(np.float32)
+    # buf[51] = 0.0 — already zero from np.zeros
+    buf[52] = np.float32(specular_strength)
+    buf[53] = np.float32(shininess)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +324,9 @@ class MetalCamera:
         self.pixel_height = pixel_height or config["pixel_height"]
         self.frame_width = frame_width or config["frame_width"]
         self.frame_height = frame_height or config["frame_height"]
+        # Match Cairo: adjust frame_height to preserve aspect ratio (frame_width is primary)
+        aspect_ratio = self.pixel_width / self.pixel_height
+        self.frame_height = self.frame_width / aspect_ratio
         self.frame_rate = frame_rate or config["frame_rate"]
         self.use_z_index = use_z_index
         self.image_mode = "RGBA"
@@ -309,6 +398,9 @@ class MetalCamera:
 
         # Cached rotation matrix (invalidated when camera params change)
         self._rotation_matrix: np.ndarray | None = None
+
+        # --- Lighting state ---
+        self._init_lighting()
 
     @property
     def phi(self) -> float:
@@ -387,6 +479,7 @@ class MetalCamera:
         def _make_center_func(m):
             def _center():
                 return m.get_center()
+
             return _center
 
         for mob in mobjects:
@@ -430,6 +523,102 @@ class MetalCamera:
             self.theta_tracker.get_value(),
             self.gamma_tracker.get_value(),
         )
+
+    # ------------------------------------------------------------------
+    # Lighting initialization and API
+    # ------------------------------------------------------------------
+
+    def _init_lighting(self) -> None:
+        """Initialize lighting ValueTrackers for Cairo-matching shading.
+
+        Defaults match Cairo ThreeDCamera's ``get_shaded_rgb`` formula:
+        ``light = 0.5 * (n·L)^3``, asymmetric shadow (half intensity).
+        Light position matches ``light_source_start_point = 9*DOWN + 7*LEFT + 10*OUT``.
+
+        The shader uses ``diffuse_strength`` as the intensity coefficient and
+        ``shininess`` as the exponent.  ``ambient_strength`` and
+        ``specular_strength`` are retained for API compatibility but unused
+        by the current Cairo-matching shader.
+        """
+        from manim.mobject.value_tracker import ValueTracker
+
+        # Light position matching Cairo ThreeDCamera:
+        # 9*DOWN + 7*LEFT + 10*OUT = (-7, -9, 10)
+        self._light_position = np.array([-7.0, -9.0, 10.0], dtype=np.float64)
+        # Light color as a numpy array (RGB, normalized)
+        self._light_color = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+
+        # Cairo formula: light = intensity * (n·L)^exponent
+        # intensity = diffuse_strength (default 0.5 matching Cairo's coefficient)
+        # exponent  = shininess        (default 3.0 matching Cairo's cubic power)
+        self.ambient_strength_tracker = ValueTracker(0.5)
+        self.diffuse_strength_tracker = ValueTracker(0.5)
+        self.specular_strength_tracker = ValueTracker(0.0)
+        self.shininess_tracker = ValueTracker(3.0)
+
+    # --- Light position ---
+
+    def set_light_position(self, pos: np.ndarray | list | tuple) -> None:
+        self._light_position = np.array(pos, dtype=np.float64)
+
+    def get_light_position(self) -> np.ndarray:
+        return self._light_position.copy()
+
+    # --- Light color ---
+
+    def set_light_color(self, color: np.ndarray | list | tuple) -> None:
+        self._light_color = np.array(color, dtype=np.float64)
+
+    def get_light_color(self) -> np.ndarray:
+        return self._light_color.copy()
+
+    # --- Ambient strength ---
+
+    @property
+    def ambient_strength(self) -> float:
+        return self.ambient_strength_tracker.get_value()
+
+    def set_ambient_strength(self, val: float) -> None:
+        self.ambient_strength_tracker.set_value(val)
+
+    def get_ambient_strength(self) -> float:
+        return self.ambient_strength_tracker.get_value()
+
+    # --- Diffuse strength ---
+
+    @property
+    def diffuse_strength(self) -> float:
+        return self.diffuse_strength_tracker.get_value()
+
+    def set_diffuse_strength(self, val: float) -> None:
+        self.diffuse_strength_tracker.set_value(val)
+
+    def get_diffuse_strength(self) -> float:
+        return self.diffuse_strength_tracker.get_value()
+
+    # --- Specular strength ---
+
+    @property
+    def specular_strength(self) -> float:
+        return self.specular_strength_tracker.get_value()
+
+    def set_specular_strength(self, val: float) -> None:
+        self.specular_strength_tracker.set_value(val)
+
+    def get_specular_strength(self) -> float:
+        return self.specular_strength_tracker.get_value()
+
+    # --- Shininess ---
+
+    @property
+    def shininess(self) -> float:
+        return self.shininess_tracker.get_value()
+
+    def set_shininess(self, val: float) -> None:
+        self.shininess_tracker.set_value(val)
+
+    def get_shininess(self) -> float:
+        return self.shininess_tracker.get_value()
 
     # ------------------------------------------------------------------
     # CairoRenderer-facing interface
@@ -585,8 +774,17 @@ class MetalCamera:
                 mobjects = list_difference_update(mobjects, all_excluded)
         return list(mobjects)
 
-    def _make_uniform_data(self, color: np.ndarray) -> np.ndarray:
-        """Build the uniform buffer for the current camera state and given color."""
+    def _make_uniform_data(self, color: np.ndarray, use_lighting: bool = False) -> np.ndarray:
+        """Build the uniform buffer for the current camera state and given color.
+
+        Parameters
+        ----------
+        color
+            RGBA color as float32 (4 elements).
+        use_lighting
+            If True, sets ``use_lighting=1`` in the uniform buffer and packs
+            all Blinn-Phong lighting parameters from the camera's ValueTrackers.
+        """
         buf = np.zeros(_UNIFORM_FLOATS, dtype=np.float32)
 
         if self._is_3d_active:
@@ -609,10 +807,69 @@ class MetalCamera:
             _pack_uniforms_2d(self._mvp_flat, color.astype(np.float32), buf)
             # is_3d already 0 from zeros
 
+        if use_lighting:
+            _set_use_lighting_flag(buf, 1)
+            _pack_lighting_params(
+                buf,
+                ambient_strength=self.ambient_strength_tracker.get_value(),
+                diffuse_strength=self.diffuse_strength_tracker.get_value(),
+                light_position=self._light_position,
+                light_color=self._light_color,
+                specular_strength=self.specular_strength_tracker.get_value(),
+                shininess=self.shininess_tracker.get_value(),
+            )
+
         return buf
 
     def _stage_all_vmobjects(self, vmobs: list[VMobject], pool, draw_ops: list[tuple]) -> None:
-        """Stage fill and stroke data for all VMobjects, using batch tessellation."""
+        """Stage fill and stroke data for all VMobjects, using batch tessellation.
+
+        Objects that need lighting (3D surfaces) take a separate path:
+        tessellated with normals, interleaved into LitVertex format, and
+        drawn with the lit pipeline variants.
+        """
+        if not vmobs:
+            return
+
+        # Separate lit from unlit objects — they use different tessellation paths
+        unlit_vmobs: list[VMobject] = []
+        unlit_indices: list[int] = []  # index into vmobs
+        lit_vmobs: list[VMobject] = []
+        lit_indices: list[int] = []
+
+        for i, vmob in enumerate(vmobs):
+            if _needs_lighting(vmob):
+                lit_vmobs.append(vmob)
+                lit_indices.append(i)
+            else:
+                unlit_vmobs.append(vmob)
+                unlit_indices.append(i)
+
+        # We process lit and unlit objects separately, then interleave draw ops
+        # in the original z-order by collecting per-object ops and merging.
+        # Key: original index in vmobs -> list of draw ops for that object.
+        per_object_ops: dict[int, list[tuple]] = {}
+
+        # --- Unlit path (existing, unchanged) ---
+        self._stage_unlit_vmobjects(unlit_vmobs, unlit_indices, pool, per_object_ops)
+
+        # --- Lit path (Phase 2: positions + normals) ---
+        self._stage_lit_vmobjects(lit_vmobs, lit_indices, pool, per_object_ops)
+
+        # --- Merge draw ops in original z-order ---
+        for i in range(len(vmobs)):
+            ops = per_object_ops.get(i)
+            if ops:
+                draw_ops.extend(ops)
+
+    def _stage_unlit_vmobjects(
+        self,
+        vmobs: list[VMobject],
+        orig_indices: list[int],
+        pool,
+        per_object_ops: dict[int, list[tuple]],
+    ) -> None:
+        """Stage unlit VMobjects using the existing position-only pipeline."""
         if not vmobs:
             return
 
@@ -659,7 +916,10 @@ class MetalCamera:
                     self._geo_cache.put_stroke(vmob, scene_sw, stroke_quads)
 
         # Stage all objects from cache into the buffer pool
-        for vmob, fill_color, stroke_color, scene_sw in obj_meta:
+        for local_i, (vmob, fill_color, stroke_color, scene_sw) in enumerate(obj_meta):
+            orig_idx = orig_indices[local_i]
+            ops: list[tuple] = []
+
             # --- Fill ---
             if fill_color is not None:
                 triangles = self._geo_cache.get_fill(vmob)
@@ -668,10 +928,9 @@ class MetalCamera:
                     uniform_off = pool.stage(uniforms)
                     vertex_off = pool.stage(triangles)
 
-                    draw_ops.append((_OP_FILL_STENCIL, vertex_off, len(triangles), uniform_off))
-                    bbox = self._bounding_quad(vmob.points)
-                    bbox_off = pool.stage(bbox)
-                    draw_ops.append((_OP_FILL_COVER, bbox_off, 6, uniform_off))
+                    n_verts = len(triangles)
+                    ops.append((_OP_FILL_STENCIL, vertex_off, n_verts, uniform_off))
+                    ops.append((_OP_FILL_COVER, vertex_off, n_verts, uniform_off))
 
             # --- Stroke ---
             if stroke_color is not None:
@@ -681,7 +940,144 @@ class MetalCamera:
                     uniform_off = pool.stage(uniforms)
                     vertex_off = pool.stage(quads)
 
-                    draw_ops.append((_OP_STROKE, vertex_off, len(quads), uniform_off))
+                    ops.append((_OP_STROKE, vertex_off, len(quads), uniform_off))
+
+            if ops:
+                per_object_ops[orig_idx] = ops
+
+    def _stage_lit_vmobjects(
+        self,
+        vmobs: list[VMobject],
+        orig_indices: list[int],
+        pool,
+        per_object_ops: dict[int, list[tuple]],
+    ) -> None:
+        """Stage lit VMobjects with normals for the Blinn-Phong pipeline.
+
+        The stencil pass still uses position-only packed_float3 buffers (12B/vert)
+        with the existing ``fill_stencil_vertex`` shader.
+
+        The cover and stroke passes switch to the lit variants which read
+        LitVertex buffers (24B/vert: [px, py, pz, nx, ny, nz]).
+        """
+        if not vmobs:
+            return
+
+        # Gather metadata and identify cache misses
+        obj_meta: list[tuple] = []  # (vmob, fill_color|None, stroke_color|None, scene_sw)
+        uncached_indices: list[int] = []
+        uncached_items: list[tuple] = []
+
+        for i, vmob in enumerate(vmobs):
+            fill_color = None
+            fill_rgba = vmob.get_fill_rgbas()
+            if len(fill_rgba) > 0 and fill_rgba[0][3] > 0:
+                fill_color = fill_rgba[0]
+
+            stroke_color = None
+            scene_sw = 0.0
+            stroke_rgba = vmob.get_stroke_rgbas()
+            sw = vmob.get_stroke_width()
+            if len(stroke_rgba) > 0 and sw > 0 and stroke_rgba[0][3] > 0:
+                # Skip thin default wireframe strokes (≤ 1.0) on lit surfaces.
+                # Cairo renders these as sub-pixel lines that are invisible;
+                # Metal quad-based strokes can't match that, so skip them.
+                if sw > 1.0:
+                    stroke_color = stroke_rgba[0]
+                    scene_sw = sw * 0.01
+
+            obj_meta.append((vmob, fill_color, stroke_color, scene_sw))
+
+            # Check if tessellation is needed (cache miss for fill or stroke)
+            need_fill = fill_color is not None and self._geo_cache.get_fill(vmob) is None
+            need_stroke = (
+                stroke_color is not None and self._geo_cache.get_stroke(vmob, scene_sw) is None
+            )
+
+            if need_fill or need_stroke:
+                uncached_indices.append(i)
+                uncached_items.append((vmob.points, scene_sw if stroke_color is not None else None))
+
+        # Batch tessellation with normals for all cache misses
+        if uncached_items:
+            batch_results = batch_tessellate(uncached_items, compute_normals=True)
+            for idx, result in zip(uncached_indices, batch_results):
+                vmob = vmobs[idx]
+                _, fill_color, stroke_color, scene_sw = obj_meta[idx]
+                # compute_normals=True returns 4-tuples:
+                # (fill_tris, fill_normals, stroke_quads, stroke_normals)
+                fill_tris, fill_normals, stroke_quads, stroke_normals = result
+                if fill_color is not None:
+                    self._geo_cache.put_fill(vmob, fill_tris)
+                if stroke_color is not None and stroke_quads is not None:
+                    self._geo_cache.put_stroke(vmob, scene_sw, stroke_quads)
+
+        # --- Phase 2: Collect fill arrays and compute globally smooth normals ---
+        # Gather all fill triangle arrays so coincident vertices across
+        # sub-mobject boundaries get averaged normals (eliminates embossing).
+        fill_tri_list: list[npt.NDArray[np.float32] | None] = []
+        for vmob, fill_color, _stroke_color, _scene_sw in obj_meta:
+            if fill_color is not None:
+                triangles = self._geo_cache.get_fill(vmob)
+                if triangles is not None and len(triangles) > 0:
+                    fill_tri_list.append(triangles)
+                else:
+                    fill_tri_list.append(None)
+            else:
+                fill_tri_list.append(None)
+
+        # Compute globally smooth normals across all sub-mobjects at once
+        non_empty_fills = [t for t in fill_tri_list if t is not None]
+        if non_empty_fills:
+            smooth_normals_list = compute_globally_smooth_normals(non_empty_fills)
+        else:
+            smooth_normals_list = []
+
+        # --- Phase 3: Stage all lit objects into the buffer pool ---
+        smooth_idx = 0  # index into smooth_normals_list (only non-empty fills)
+        for local_i, (vmob, fill_color, stroke_color, scene_sw) in enumerate(obj_meta):
+            orig_idx = orig_indices[local_i]
+            ops: list[tuple] = []
+
+            # --- Fill (lit) ---
+            if fill_color is not None:
+                triangles = fill_tri_list[local_i]
+                if triangles is not None and len(triangles) > 0:
+                    normals = smooth_normals_list[smooth_idx]
+                    smooth_idx += 1
+
+                    # Stencil pass uses position-only buffer (same as unlit)
+                    stencil_uniforms = self._make_uniform_data(fill_color)
+                    stencil_uniform_off = pool.stage(stencil_uniforms)
+                    stencil_vertex_off = pool.stage(triangles)
+                    n_verts = len(triangles)
+                    ops.append((_OP_FILL_STENCIL, stencil_vertex_off, n_verts, stencil_uniform_off))
+
+                    # Cover pass uses LitVertex buffer (pos + normal)
+                    lit_verts = _interleave_pos_normal(triangles, normals)
+                    lit_uniforms = self._make_uniform_data(fill_color, use_lighting=True)
+                    lit_uniform_off = pool.stage(lit_uniforms)
+                    lit_vertex_off = pool.stage(lit_verts)
+                    ops.append((_OP_FILL_COVER_LIT, lit_vertex_off, n_verts, lit_uniform_off))
+                else:
+                    # fill_tri_list entry was None — skip smooth_idx
+                    pass
+
+            # --- Stroke (lit) ---
+            if stroke_color is not None:
+                quads = self._geo_cache.get_stroke(vmob, scene_sw)
+                if quads is not None and len(quads) > 0:
+                    # Compute normals for the cached stroke quads
+                    stroke_normals = compute_stroke_face_normals(quads)
+
+                    lit_stroke = _interleave_pos_normal(quads, stroke_normals)
+                    lit_uniforms = self._make_uniform_data(stroke_color, use_lighting=True)
+                    lit_uniform_off = pool.stage(lit_uniforms)
+                    lit_vertex_off = pool.stage(lit_stroke)
+                    ops.append((_OP_STROKE_LIT, lit_vertex_off, len(quads), lit_uniform_off))
+
+            if ops:
+                per_object_ops[orig_idx] = ops
 
     # ------------------------------------------------------------------
     # Internal helpers — Pass 2: encoding
@@ -706,14 +1102,16 @@ class MetalCamera:
                 Metal.MTLPrimitiveTypeTriangle, 0, vert_count
             )
         elif kind == _OP_FILL_COVER:
-            _, bbox_off, _vert_count, uni_off = op
+            _, vert_off, vert_count, uni_off = op
             tracker.set_pipeline(self.ctx._fill_cover_pso)
             tracker.set_depth_stencil(self.ctx._stencil_nonzero_dss)
             tracker.set_stencil_ref(0)
-            encoder.setVertexBufferOffset_atIndex_(bbox_off, 0)
+            encoder.setVertexBufferOffset_atIndex_(vert_off, 0)
             encoder.setVertexBufferOffset_atIndex_(uni_off, 1)
             encoder.setFragmentBufferOffset_atIndex_(uni_off, 1)
-            encoder.drawPrimitives_vertexStart_vertexCount_(Metal.MTLPrimitiveTypeTriangle, 0, 6)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
         elif kind == _OP_STROKE:
             _, vert_off, vert_count, uni_off = op
             tracker.set_pipeline(self.ctx._stroke_pso)
@@ -724,40 +1122,29 @@ class MetalCamera:
             encoder.drawPrimitives_vertexStart_vertexCount_(
                 Metal.MTLPrimitiveTypeTriangle, 0, vert_count
             )
-
-    # ------------------------------------------------------------------
-    # Geometry helpers
-    # ------------------------------------------------------------------
-
-    def _bounding_quad(self, points) -> np.ndarray:
-        """Compute a bounding quad (2 triangles, 6 vertices of float3) for cover pass.
-
-        In 3D mode the z is set to the centroid z of the object's points,
-        so the bounding quad is placed at the correct depth for occlusion.
-        """
-        xy = points[:, :2]
-        x_min, y_min = xy.min(axis=0)
-        x_max, y_max = xy.max(axis=0)
-        # Slight padding to ensure coverage
-        pad = 0.01
-        x_min -= pad
-        y_min -= pad
-        x_max += pad
-        y_max += pad
-        # Use centroid z for depth placement
-        z = float(points[:, 2].mean()) if points.shape[1] >= 3 else 0.0
-        # Two triangles forming the quad (float3)
-        return np.array(
-            [
-                [x_min, y_min, z],
-                [x_max, y_min, z],
-                [x_max, y_max, z],
-                [x_min, y_min, z],
-                [x_max, y_max, z],
-                [x_min, y_max, z],
-            ],
-            dtype=np.float32,
-        )
+        elif kind == _OP_FILL_COVER_LIT:
+            # Lit cover pass: LitVertex buffer (24B/vert), Blinn-Phong shading
+            _, vert_off, vert_count, uni_off = op
+            tracker.set_pipeline(self.ctx._fill_cover_lit_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_nonzero_dss)
+            tracker.set_stencil_ref(0)
+            encoder.setVertexBufferOffset_atIndex_(vert_off, 0)
+            encoder.setVertexBufferOffset_atIndex_(uni_off, 1)
+            encoder.setFragmentBufferOffset_atIndex_(uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
+        elif kind == _OP_STROKE_LIT:
+            # Lit stroke pass: LitVertex buffer (24B/vert), Blinn-Phong shading
+            _, vert_off, vert_count, uni_off = op
+            tracker.set_pipeline(self.ctx._stroke_lit_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_disabled_dss)
+            encoder.setVertexBufferOffset_atIndex_(vert_off, 0)
+            encoder.setVertexBufferOffset_atIndex_(uni_off, 1)
+            encoder.setFragmentBufferOffset_atIndex_(uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
 
     def _readback_texture(self) -> None:
         """Read the Metal render target directly into self.pixel_array."""
