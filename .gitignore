@@ -12,7 +12,10 @@ wheels/
 # Manim render output
 media/
 media_cairo/
+media_cairo_hq/
 media_metal/
+media_metal_hq/
+media_verify/
 
 # macOS
 .DS_Store
