@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING, Any
 import Metal
 import numpy as np
 from manim._config import config
+from manim.mobject.three_d.three_d_utils import (
+    get_3d_vmob_end_corner,
+    get_3d_vmob_end_corner_unit_normal,
+    get_3d_vmob_start_corner,
+    get_3d_vmob_start_corner_unit_normal,
+)
 from manim.mobject.types.vectorized_mobject import VMobject
 from manim.utils.color import color_to_int_rgba
 from manim.utils.family import extract_mobject_family_members
@@ -20,12 +26,9 @@ from manim_metal.utils import (
     batch_tessellate,
     build_rotation_matrix,
     build_world_to_ndc_matrix,
-    compute_globally_smooth_normals,
-    compute_stroke_face_normals,
 )
 
 if TYPE_CHECKING:
-    import numpy.typing as npt
     from manim.mobject.mobject import Mobject
     from manim.typing import PixelArray
 
@@ -40,6 +43,14 @@ _OP_FILL_COVER = 1  # fill+depth pass: same triangles, color write + depth write
 _OP_STROKE = 2  # stroke pass: stroke quads, depth test, no stencil
 _OP_FILL_COVER_LIT = 3  # lit cover pass: LitVertex buffer (pos+normal), Blinn-Phong shading
 _OP_STROKE_LIT = 4  # lit stroke pass: LitVertex buffer (pos+normal), Blinn-Phong shading
+_OP_FILL_COVER_TRANSPARENT = 5  # fill pass with depth write OFF (transparent fills)
+_OP_STROKE_TRANSPARENT = 6  # stroke pass with depth write OFF (transparent strokes)
+
+# Below this on-screen stroke width (in pixels), a 3D surface's facet wireframe
+# stroke is treated as Cairo treats it: a sub-pixel line invisible against the
+# fill.  Suppressed so Metal's solid quad strokes don't draw a wireframe that
+# Cairo never shows.  ~1px matches Cairo's sub-pixel AA vanishing point.
+_MIN_FACET_STROKE_PX = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +161,91 @@ def _needs_lighting(vmob: VMobject) -> bool:
         pass
 
     return False
+
+
+def _shade_value(
+    normal: np.ndarray,
+    point: np.ndarray,
+    light_pos: np.ndarray,
+    intensity: float,
+    exponent: float,
+) -> float:
+    """Scalar light value to add to a colour, matching Cairo's ``get_shaded_rgb``.
+
+    Cairo computes ``light = 0.5 * (n·to_sun)**3`` (halved when negative).
+    We use the sign-aware form ``intensity * |n·to_sun|**exponent`` with an
+    asymmetric ``*0.5`` in shadow, which is *identical* to Cairo for the
+    default ``intensity=0.5, exponent=3`` and also stays finite for arbitrary
+    (animatable) exponents.
+    """
+    d = light_pos - point
+    norm = np.linalg.norm(d)
+    if norm == 0.0:
+        return 0.0
+    n_dot_l = float(np.dot(normal, d / norm))
+    magnitude = intensity * (abs(n_dot_l) ** exponent)
+    return magnitude if n_dot_l >= 0.0 else -magnitude * 0.5
+
+
+def _cairo_shade_rgba(
+    vmob: VMobject,
+    base_rgba: np.ndarray,
+    light_pos: np.ndarray,
+    intensity: float = 0.5,
+    exponent: float = 3.0,
+) -> np.ndarray:
+    """Compute Cairo's exact per-facet shaded color for a 3D facet VMobject.
+
+    Manim's Cairo ``ThreeDCamera.modified_rgbas`` shades each facet by
+    evaluating ``get_shaded_rgb`` at the facet's *start corner* and *end
+    corner*, then fills the facet with a linear gradient between the two.
+    Both the corner points and their unit normals are taken in **world
+    space**, so the result is independent of the camera angle.
+
+    We reproduce that using Manim's own corner/normal helpers and the same
+    shading formula, then collapse the 2-stop gradient to its area-average
+    (the exact mean color of a linear gradient over the facet) so the facet
+    can be drawn flat through the unlit fill pipeline — which is already
+    pixel-identical to Cairo.  With the default ``intensity``/``exponent`` the
+    result matches Cairo bit-for-bit; the parameters are exposed so the
+    camera's animatable lighting controls still work.
+
+    Parameters
+    ----------
+    vmob
+        The facet VMobject (``shade_in_3d`` is True).
+    base_rgba
+        The unshaded fill/stroke colour, RGBA float in ``[0, 1]``.
+    light_pos
+        World-space light source position (Cairo default: ``(-7, -9, 10)``).
+    intensity, exponent
+        Shading coefficient and falloff exponent.  Cairo's fixed values are
+        ``0.5`` and ``3.0`` (the camera defaults).
+
+    Returns
+    -------
+    np.ndarray
+        Shaded RGBA float array (alpha preserved from ``base_rgba``).
+    """
+    rgb = np.asarray(base_rgba[:3], dtype=np.float64)
+    l0 = _shade_value(
+        get_3d_vmob_start_corner_unit_normal(vmob),
+        get_3d_vmob_start_corner(vmob),
+        light_pos,
+        intensity,
+        exponent,
+    )
+    l1 = _shade_value(
+        get_3d_vmob_end_corner_unit_normal(vmob),
+        get_3d_vmob_end_corner(vmob),
+        light_pos,
+        intensity,
+        exponent,
+    )
+    shaded = np.clip(rgb + 0.5 * (l0 + l1), 0.0, 1.0)
+    out = np.array(base_rgba, dtype=base_rgba.dtype, copy=True)
+    out[:3] = shaded
+    return out
 
 
 def _interleave_pos_normal(positions: np.ndarray, normals: np.ndarray) -> np.ndarray:
@@ -316,6 +412,7 @@ class MetalCamera:
         background_color=None,
         background_opacity: float | None = None,
         use_z_index: bool = True,
+        fxaa: bool = False,
         **kwargs: Any,
     ) -> None:
         from manim.utils.color import ManimColor
@@ -348,6 +445,13 @@ class MetalCamera:
 
         # Initialize Metal context
         self.ctx = MetalContext(self.pixel_width, self.pixel_height)
+
+        # FXAA post-process anti-aliasing (applied after MSAA resolve).
+        # Default OFF: Cairo applies no post-process AA, so FXAA makes the
+        # Metal output diverge from the Cairo reference (measured: every 2D
+        # scene's edge error increases).  Kept as an opt-in for users who
+        # prefer smoother edges over strict Cairo parity.
+        self._fxaa_enabled = fxaa
 
         # Initialize pixel array (RGBA uint8)
         self.pixel_array: PixelArray = np.zeros(
@@ -735,8 +839,12 @@ class MetalCamera:
 
         raw_encoder.endEncoding()
 
-        # Blit resolved texture → shared readback buffer (GPU untiles, zero-copy on UMA)
-        self.ctx.blit_texture_to_readback(cmd)
+        # Optional FXAA post-process: smooth remaining aliased edges after MSAA resolve
+        if self._fxaa_enabled:
+            self.ctx.apply_fxaa(cmd)
+            self.ctx.blit_texture_to_readback(cmd, source=self.ctx.fxaa_target)
+        else:
+            self.ctx.blit_texture_to_readback(cmd)
 
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -824,37 +932,20 @@ class MetalCamera:
     def _stage_all_vmobjects(self, vmobs: list[VMobject], pool, draw_ops: list[tuple]) -> None:
         """Stage fill and stroke data for all VMobjects, using batch tessellation.
 
-        Objects that need lighting (3D surfaces) take a separate path:
-        tessellated with normals, interleaved into LitVertex format, and
-        drawn with the lit pipeline variants.
+        Every object — 2D, unlit 3D, and lit 3D surface facets — goes through
+        the single unlit fill/stroke pipeline, which is pixel-identical to
+        Cairo.  Facets that need lighting (``shade_in_3d``) have their fill and
+        stroke colours pre-shaded on the CPU with Cairo's exact per-facet
+        formula before staging (see :func:`_cairo_shade_rgba`).  This matches
+        Cairo's flat-faceted look exactly, rather than the smooth per-vertex
+        normals of the earlier GPU lighting path.
         """
         if not vmobs:
             return
 
-        # Separate lit from unlit objects — they use different tessellation paths
-        unlit_vmobs: list[VMobject] = []
-        unlit_indices: list[int] = []  # index into vmobs
-        lit_vmobs: list[VMobject] = []
-        lit_indices: list[int] = []
-
-        for i, vmob in enumerate(vmobs):
-            if _needs_lighting(vmob):
-                lit_vmobs.append(vmob)
-                lit_indices.append(i)
-            else:
-                unlit_vmobs.append(vmob)
-                unlit_indices.append(i)
-
-        # We process lit and unlit objects separately, then interleave draw ops
-        # in the original z-order by collecting per-object ops and merging.
         # Key: original index in vmobs -> list of draw ops for that object.
         per_object_ops: dict[int, list[tuple]] = {}
-
-        # --- Unlit path (existing, unchanged) ---
-        self._stage_unlit_vmobjects(unlit_vmobs, unlit_indices, pool, per_object_ops)
-
-        # --- Lit path (Phase 2: positions + normals) ---
-        self._stage_lit_vmobjects(lit_vmobs, lit_indices, pool, per_object_ops)
+        self._stage_unlit_vmobjects(vmobs, list(range(len(vmobs))), pool, per_object_ops)
 
         # --- Merge draw ops in original z-order ---
         for i in range(len(vmobs)):
@@ -878,6 +969,13 @@ class MetalCamera:
         uncached_indices: list[int] = []
         uncached_items: list[tuple] = []
 
+        # Per-frame lighting state (constant across objects).  Defaults match
+        # Cairo (intensity 0.5, exponent 3.0); the camera lets users animate them.
+        light = self._light_position
+        intensity = self.diffuse_strength_tracker.get_value()
+        exponent = self.shininess_tracker.get_value()
+        px_per_unit = self.pixel_width / self.frame_width
+
         for i, vmob in enumerate(vmobs):
             fill_color = None
             fill_rgba = vmob.get_fill_rgbas()
@@ -891,6 +989,28 @@ class MetalCamera:
             if len(stroke_rgba) > 0 and sw > 0 and stroke_rgba[0][3] > 0:
                 stroke_color = stroke_rgba[0]
                 scene_sw = sw * 0.01
+
+            # 3D facets: pre-shade fill/stroke colours with Cairo's exact
+            # per-facet formula so they render flat-faceted through the unlit
+            # pipeline, matching Cairo's ThreeDCamera output.
+            if _needs_lighting(vmob):
+                if fill_color is not None:
+                    fill_color = _cairo_shade_rgba(vmob, fill_color, light, intensity, exponent)
+                if stroke_color is not None:
+                    # Surface facets carry a default 0.5-width wireframe stroke.
+                    # In Cairo these render as sub-pixel, heavily-antialiased
+                    # lines that are essentially invisible against the fill;
+                    # Metal's quad strokes render them as solid ~1px lines that
+                    # Cairo never shows.  Suppress facet strokes thinner than
+                    # ~1px on screen (resolution-aware, tracking Cairo's own
+                    # vanishing of sub-pixel strokes) so surfaces match.
+                    if scene_sw * px_per_unit < _MIN_FACET_STROKE_PX:
+                        stroke_color = None
+                        scene_sw = 0.0
+                    else:
+                        stroke_color = _cairo_shade_rgba(
+                            vmob, stroke_color, light, intensity, exponent
+                        )
 
             obj_meta.append((vmob, fill_color, stroke_color, scene_sw))
 
@@ -930,7 +1050,12 @@ class MetalCamera:
 
                     n_verts = len(triangles)
                     ops.append((_OP_FILL_STENCIL, vertex_off, n_verts, uniform_off))
-                    ops.append((_OP_FILL_COVER, vertex_off, n_verts, uniform_off))
+                    # Use transparent variant (no depth write) for semi-transparent fills
+                    # so objects behind are not incorrectly occluded.
+                    cover_op = (
+                        _OP_FILL_COVER_TRANSPARENT if fill_color[3] < 1.0 else _OP_FILL_COVER
+                    )
+                    ops.append((cover_op, vertex_off, n_verts, uniform_off))
 
             # --- Stroke ---
             if stroke_color is not None:
@@ -940,141 +1065,10 @@ class MetalCamera:
                     uniform_off = pool.stage(uniforms)
                     vertex_off = pool.stage(quads)
 
-                    ops.append((_OP_STROKE, vertex_off, len(quads), uniform_off))
-
-            if ops:
-                per_object_ops[orig_idx] = ops
-
-    def _stage_lit_vmobjects(
-        self,
-        vmobs: list[VMobject],
-        orig_indices: list[int],
-        pool,
-        per_object_ops: dict[int, list[tuple]],
-    ) -> None:
-        """Stage lit VMobjects with normals for the Blinn-Phong pipeline.
-
-        The stencil pass still uses position-only packed_float3 buffers (12B/vert)
-        with the existing ``fill_stencil_vertex`` shader.
-
-        The cover and stroke passes switch to the lit variants which read
-        LitVertex buffers (24B/vert: [px, py, pz, nx, ny, nz]).
-        """
-        if not vmobs:
-            return
-
-        # Gather metadata and identify cache misses
-        obj_meta: list[tuple] = []  # (vmob, fill_color|None, stroke_color|None, scene_sw)
-        uncached_indices: list[int] = []
-        uncached_items: list[tuple] = []
-
-        for i, vmob in enumerate(vmobs):
-            fill_color = None
-            fill_rgba = vmob.get_fill_rgbas()
-            if len(fill_rgba) > 0 and fill_rgba[0][3] > 0:
-                fill_color = fill_rgba[0]
-
-            stroke_color = None
-            scene_sw = 0.0
-            stroke_rgba = vmob.get_stroke_rgbas()
-            sw = vmob.get_stroke_width()
-            if len(stroke_rgba) > 0 and sw > 0 and stroke_rgba[0][3] > 0:
-                # Skip thin default wireframe strokes (≤ 1.0) on lit surfaces.
-                # Cairo renders these as sub-pixel lines that are invisible;
-                # Metal quad-based strokes can't match that, so skip them.
-                if sw > 1.0:
-                    stroke_color = stroke_rgba[0]
-                    scene_sw = sw * 0.01
-
-            obj_meta.append((vmob, fill_color, stroke_color, scene_sw))
-
-            # Check if tessellation is needed (cache miss for fill or stroke)
-            need_fill = fill_color is not None and self._geo_cache.get_fill(vmob) is None
-            need_stroke = (
-                stroke_color is not None and self._geo_cache.get_stroke(vmob, scene_sw) is None
-            )
-
-            if need_fill or need_stroke:
-                uncached_indices.append(i)
-                uncached_items.append((vmob.points, scene_sw if stroke_color is not None else None))
-
-        # Batch tessellation with normals for all cache misses
-        if uncached_items:
-            batch_results = batch_tessellate(uncached_items, compute_normals=True)
-            for idx, result in zip(uncached_indices, batch_results):
-                vmob = vmobs[idx]
-                _, fill_color, stroke_color, scene_sw = obj_meta[idx]
-                # compute_normals=True returns 4-tuples:
-                # (fill_tris, fill_normals, stroke_quads, stroke_normals)
-                fill_tris, fill_normals, stroke_quads, stroke_normals = result
-                if fill_color is not None:
-                    self._geo_cache.put_fill(vmob, fill_tris)
-                if stroke_color is not None and stroke_quads is not None:
-                    self._geo_cache.put_stroke(vmob, scene_sw, stroke_quads)
-
-        # --- Phase 2: Collect fill arrays and compute globally smooth normals ---
-        # Gather all fill triangle arrays so coincident vertices across
-        # sub-mobject boundaries get averaged normals (eliminates embossing).
-        fill_tri_list: list[npt.NDArray[np.float32] | None] = []
-        for vmob, fill_color, _stroke_color, _scene_sw in obj_meta:
-            if fill_color is not None:
-                triangles = self._geo_cache.get_fill(vmob)
-                if triangles is not None and len(triangles) > 0:
-                    fill_tri_list.append(triangles)
-                else:
-                    fill_tri_list.append(None)
-            else:
-                fill_tri_list.append(None)
-
-        # Compute globally smooth normals across all sub-mobjects at once
-        non_empty_fills = [t for t in fill_tri_list if t is not None]
-        if non_empty_fills:
-            smooth_normals_list = compute_globally_smooth_normals(non_empty_fills)
-        else:
-            smooth_normals_list = []
-
-        # --- Phase 3: Stage all lit objects into the buffer pool ---
-        smooth_idx = 0  # index into smooth_normals_list (only non-empty fills)
-        for local_i, (vmob, fill_color, stroke_color, scene_sw) in enumerate(obj_meta):
-            orig_idx = orig_indices[local_i]
-            ops: list[tuple] = []
-
-            # --- Fill (lit) ---
-            if fill_color is not None:
-                triangles = fill_tri_list[local_i]
-                if triangles is not None and len(triangles) > 0:
-                    normals = smooth_normals_list[smooth_idx]
-                    smooth_idx += 1
-
-                    # Stencil pass uses position-only buffer (same as unlit)
-                    stencil_uniforms = self._make_uniform_data(fill_color)
-                    stencil_uniform_off = pool.stage(stencil_uniforms)
-                    stencil_vertex_off = pool.stage(triangles)
-                    n_verts = len(triangles)
-                    ops.append((_OP_FILL_STENCIL, stencil_vertex_off, n_verts, stencil_uniform_off))
-
-                    # Cover pass uses LitVertex buffer (pos + normal)
-                    lit_verts = _interleave_pos_normal(triangles, normals)
-                    lit_uniforms = self._make_uniform_data(fill_color, use_lighting=True)
-                    lit_uniform_off = pool.stage(lit_uniforms)
-                    lit_vertex_off = pool.stage(lit_verts)
-                    ops.append((_OP_FILL_COVER_LIT, lit_vertex_off, n_verts, lit_uniform_off))
-                else:
-                    # fill_tri_list entry was None — skip smooth_idx
-                    pass
-
-            # --- Stroke (lit) ---
-            if stroke_color is not None:
-                quads = self._geo_cache.get_stroke(vmob, scene_sw)
-                if quads is not None and len(quads) > 0:
-                    # Compute normals for the cached stroke quads
-                    stroke_normals = compute_stroke_face_normals(quads)
-
-                    lit_stroke = _interleave_pos_normal(quads, stroke_normals)
-                    lit_uniforms = self._make_uniform_data(stroke_color, use_lighting=True)
-                    lit_uniform_off = pool.stage(lit_uniforms)
-                    lit_vertex_off = pool.stage(lit_stroke)
-                    ops.append((_OP_STROKE_LIT, lit_vertex_off, len(quads), lit_uniform_off))
+                    stroke_op = (
+                        _OP_STROKE_TRANSPARENT if stroke_color[3] < 1.0 else _OP_STROKE
+                    )
+                    ops.append((stroke_op, vertex_off, len(quads), uniform_off))
 
             if ops:
                 per_object_ops[orig_idx] = ops
@@ -1139,6 +1133,29 @@ class MetalCamera:
             _, vert_off, vert_count, uni_off = op
             tracker.set_pipeline(self.ctx._stroke_lit_pso)
             tracker.set_depth_stencil(self.ctx._stencil_disabled_dss)
+            encoder.setVertexBufferOffset_atIndex_(vert_off, 0)
+            encoder.setVertexBufferOffset_atIndex_(uni_off, 1)
+            encoder.setFragmentBufferOffset_atIndex_(uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
+        elif kind == _OP_FILL_COVER_TRANSPARENT:
+            # Transparent fill: same as cover but no depth write
+            _, vert_off, vert_count, uni_off = op
+            tracker.set_pipeline(self.ctx._fill_cover_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_nonzero_no_depth_write_dss)
+            tracker.set_stencil_ref(0)
+            encoder.setVertexBufferOffset_atIndex_(vert_off, 0)
+            encoder.setVertexBufferOffset_atIndex_(uni_off, 1)
+            encoder.setFragmentBufferOffset_atIndex_(uni_off, 1)
+            encoder.drawPrimitives_vertexStart_vertexCount_(
+                Metal.MTLPrimitiveTypeTriangle, 0, vert_count
+            )
+        elif kind == _OP_STROKE_TRANSPARENT:
+            # Transparent stroke: same as stroke but no depth write
+            _, vert_off, vert_count, uni_off = op
+            tracker.set_pipeline(self.ctx._stroke_pso)
+            tracker.set_depth_stencil(self.ctx._stencil_disabled_no_depth_write_dss)
             encoder.setVertexBufferOffset_atIndex_(vert_off, 0)
             encoder.setVertexBufferOffset_atIndex_(uni_off, 1)
             encoder.setFragmentBufferOffset_atIndex_(uni_off, 1)
