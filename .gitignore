@@ -17,5 +17,9 @@ media_metal/
 media_metal_hq/
 media_verify/
 
+# Cairo-vs-Metal parity comparison output (compare_metric.py / compare_video.py)
+media_compare/
+media_vcmp/
+
 # macOS
 .DS_Store
