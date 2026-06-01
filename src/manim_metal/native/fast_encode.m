@@ -22,11 +22,13 @@ typedef struct {
 
 // Draw op kinds — must match Python constants in metal_camera.py
 enum {
-    OP_FILL_STENCIL    = 0,
-    OP_FILL_COVER      = 1,
-    OP_STROKE          = 2,
-    OP_FILL_COVER_LIT  = 3,
-    OP_STROKE_LIT      = 4,
+    OP_FILL_STENCIL           = 0,
+    OP_FILL_COVER             = 1,
+    OP_STROKE                 = 2,
+    OP_FILL_COVER_LIT         = 3,
+    OP_STROKE_LIT             = 4,
+    OP_FILL_COVER_TRANSPARENT = 5,
+    OP_STROKE_TRANSPARENT     = 6,
 };
 
 void encode_draw_ops(
@@ -41,7 +43,9 @@ void encode_draw_ops(
     void *stencil_nz_dss_ptr,
     void *stencil_disabled_dss_ptr,
     void *fill_cover_lit_pso_ptr,
-    void *stroke_lit_pso_ptr
+    void *stroke_lit_pso_ptr,
+    void *stencil_nz_no_dw_dss_ptr,
+    void *stencil_disabled_no_dw_dss_ptr
 ) {
     id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoder_ptr;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buf_ptr;
@@ -52,9 +56,11 @@ void encode_draw_ops(
     id<MTLRenderPipelineState> fill_cover_lit_pso  = (__bridge id<MTLRenderPipelineState>)fill_cover_lit_pso_ptr;
     id<MTLRenderPipelineState> stroke_lit_pso      = (__bridge id<MTLRenderPipelineState>)stroke_lit_pso_ptr;
 
-    id<MTLDepthStencilState> stencil_inc_dss      = (__bridge id<MTLDepthStencilState>)stencil_inc_dss_ptr;
-    id<MTLDepthStencilState> stencil_nz_dss       = (__bridge id<MTLDepthStencilState>)stencil_nz_dss_ptr;
-    id<MTLDepthStencilState> stencil_disabled_dss = (__bridge id<MTLDepthStencilState>)stencil_disabled_dss_ptr;
+    id<MTLDepthStencilState> stencil_inc_dss          = (__bridge id<MTLDepthStencilState>)stencil_inc_dss_ptr;
+    id<MTLDepthStencilState> stencil_nz_dss           = (__bridge id<MTLDepthStencilState>)stencil_nz_dss_ptr;
+    id<MTLDepthStencilState> stencil_disabled_dss     = (__bridge id<MTLDepthStencilState>)stencil_disabled_dss_ptr;
+    id<MTLDepthStencilState> stencil_nz_no_dw_dss     = (__bridge id<MTLDepthStencilState>)stencil_nz_no_dw_dss_ptr;
+    id<MTLDepthStencilState> stencil_disabled_no_dw   = (__bridge id<MTLDepthStencilState>)stencil_disabled_no_dw_dss_ptr;
 
     // State tracking — skip redundant calls
     id<MTLRenderPipelineState> cur_pso = nil;
@@ -152,6 +158,46 @@ void encode_draw_ops(
                 if (cur_dss != stencil_disabled_dss) {
                     [enc setDepthStencilState:stencil_disabled_dss];
                     cur_dss = stencil_disabled_dss;
+                }
+                [enc setVertexBufferOffset:(NSUInteger)op->vert_offset atIndex:0];
+                [enc setVertexBufferOffset:(NSUInteger)op->uniform_offset atIndex:1];
+                [enc setFragmentBufferOffset:(NSUInteger)op->uniform_offset atIndex:1];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:(NSUInteger)op->vert_count];
+                break;
+            }
+            case OP_FILL_COVER_TRANSPARENT: {
+                // Same as fill cover but no depth write (transparent fills)
+                if (cur_pso != fill_cover_pso) {
+                    [enc setRenderPipelineState:fill_cover_pso];
+                    cur_pso = fill_cover_pso;
+                }
+                if (cur_dss != stencil_nz_no_dw_dss) {
+                    [enc setDepthStencilState:stencil_nz_no_dw_dss];
+                    cur_dss = stencil_nz_no_dw_dss;
+                }
+                if (cur_stencil_ref != 0) {
+                    [enc setStencilReferenceValue:0];
+                    cur_stencil_ref = 0;
+                }
+                [enc setVertexBufferOffset:(NSUInteger)op->vert_offset atIndex:0];
+                [enc setVertexBufferOffset:(NSUInteger)op->uniform_offset atIndex:1];
+                [enc setFragmentBufferOffset:(NSUInteger)op->uniform_offset atIndex:1];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:(NSUInteger)op->vert_count];
+                break;
+            }
+            case OP_STROKE_TRANSPARENT: {
+                // Same as stroke but no depth write (transparent strokes)
+                if (cur_pso != stroke_pso) {
+                    [enc setRenderPipelineState:stroke_pso];
+                    cur_pso = stroke_pso;
+                }
+                if (cur_dss != stencil_disabled_no_dw) {
+                    [enc setDepthStencilState:stencil_disabled_no_dw];
+                    cur_dss = stencil_disabled_no_dw;
                 }
                 [enc setVertexBufferOffset:(NSUInteger)op->vert_offset atIndex:0];
                 [enc setVertexBufferOffset:(NSUInteger)op->uniform_offset atIndex:1];

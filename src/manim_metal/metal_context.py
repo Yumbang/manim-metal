@@ -129,11 +129,12 @@ class MetalContext:
         self._libraries: dict[str, Metal.MTLLibrary] = {}
         self._compile_shaders()
 
-        # Create render targets (MSAA + resolve + depth)
+        # Create render targets (MSAA + resolve + depth + FXAA)
         self._create_render_target()
         self._create_msaa_target()
         self._create_stencil_target()
         self._create_depth_target()
+        self._create_fxaa_target()
 
         # Create pipeline states (unlit)
         self._fill_stencil_pso = self._make_fill_stencil_pipeline()
@@ -144,10 +145,22 @@ class MetalContext:
         self._fill_cover_lit_pso = self._make_fill_cover_lit_pipeline()
         self._stroke_lit_pso = self._make_stroke_lit_pipeline()
 
+        # FXAA post-process compute pipeline
+        self._fxaa_pso = self._make_fxaa_pipeline()
+        self._fxaa_sampler = self._make_fxaa_sampler()
+
         # Depth-stencil states
         self._stencil_increment_dss = self._make_stencil_increment_state()
         self._stencil_nonzero_dss = self._make_stencil_nonzero_state()
         self._stencil_disabled_dss = self._make_stencil_disabled_state()
+        # Transparent variants: depth read but no depth write, so objects
+        # behind semi-transparent fills/strokes are not incorrectly occluded.
+        self._stencil_nonzero_no_depth_write_dss = (
+            self._make_stencil_nonzero_no_depth_write_state()
+        )
+        self._stencil_disabled_no_depth_write_dss = (
+            self._make_stencil_disabled_no_depth_write_state()
+        )
 
         # Buffer pool for sub-allocation
         self.buffer_pool = BufferPool(self.device)
@@ -180,10 +193,10 @@ class MetalContext:
         lighting_h_path = _SHADER_DIR / "lighting.h"
         lighting_h_src = lighting_h_path.read_text() if lighting_h_path.exists() else ""
 
-        for name in ("fill", "stroke", "blit"):
+        for name in ("fill", "stroke", "blit", "fxaa"):
             src_path = _SHADER_DIR / f"{name}.metal"
             source = src_path.read_text()
-            # Prepend lighting.h to fill and stroke (not blit)
+            # Prepend lighting.h to fill and stroke (not blit or fxaa)
             if lighting_h_src and name in ("fill", "stroke"):
                 source = lighting_h_src + "\n" + source
             library, error = self.device.newLibraryWithSource_options_error_(source, None, None)
@@ -250,6 +263,19 @@ class MetalContext:
         desc.setUsage_(Metal.MTLTextureUsageRenderTarget)
         desc.setStorageMode_(Metal.MTLStorageModePrivate)
         self.depth_target = self.device.newTextureWithDescriptor_(desc)
+
+    def _create_fxaa_target(self) -> None:
+        """Non-MSAA texture for FXAA compute output."""
+        make_tex = Metal.MTLTextureDescriptor
+        desc = make_tex.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
+            Metal.MTLPixelFormatRGBA8Unorm,
+            self.width,
+            self.height,
+            False,
+        )
+        desc.setUsage_(Metal.MTLTextureUsageShaderWrite | Metal.MTLTextureUsageShaderRead)
+        desc.setStorageMode_(Metal.MTLStorageModePrivate)
+        self.fxaa_target = self.device.newTextureWithDescriptor_(desc)
 
     # ------------------------------------------------------------------
     # Pipeline states
@@ -429,6 +455,75 @@ class MetalContext:
         desc.setDepthWriteEnabled_(True)
         return self.device.newDepthStencilStateWithDescriptor_(desc)
 
+    def _make_stencil_nonzero_no_depth_write_state(self):
+        """DSS for transparent cover pass: stencil NZ→0, depth read, no depth write.
+
+        Same stencil behavior as the opaque variant but depth write is OFF
+        so objects behind semi-transparent fills are not incorrectly occluded.
+        """
+        desc = Metal.MTLDepthStencilDescriptor.alloc().init()
+        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
+        desc.setDepthWriteEnabled_(False)
+        stencil_desc = Metal.MTLStencilDescriptor.alloc().init()
+        stencil_desc.setStencilCompareFunction_(Metal.MTLCompareFunctionNotEqual)
+        stencil_desc.setDepthStencilPassOperation_(Metal.MTLStencilOperationZero)
+        stencil_desc.setStencilFailureOperation_(Metal.MTLStencilOperationKeep)
+        stencil_desc.setDepthFailureOperation_(Metal.MTLStencilOperationZero)
+        stencil_desc.setReadMask_(0xFF)
+        stencil_desc.setWriteMask_(0xFF)
+        desc.setFrontFaceStencil_(stencil_desc)
+        desc.setBackFaceStencil_(stencil_desc)
+        return self.device.newDepthStencilStateWithDescriptor_(desc)
+
+    def _make_stencil_disabled_no_depth_write_state(self):
+        """DSS for transparent stroke rendering: depth read, no depth write."""
+        desc = Metal.MTLDepthStencilDescriptor.alloc().init()
+        desc.setDepthCompareFunction_(Metal.MTLCompareFunctionLessEqual)
+        desc.setDepthWriteEnabled_(False)
+        return self.device.newDepthStencilStateWithDescriptor_(desc)
+
+    # ------------------------------------------------------------------
+    # FXAA post-process
+    # ------------------------------------------------------------------
+
+    def _make_fxaa_pipeline(self):
+        """Create the FXAA compute pipeline state."""
+        fxaa_fn = self._get_function("fxaa", "fxaa_kernel")
+        pso, error = self.device.newComputePipelineStateWithFunction_error_(fxaa_fn, None)
+        if error is not None:
+            raise RuntimeError(f"FXAA compute pipeline creation failed: {error}")
+        return pso
+
+    def _make_fxaa_sampler(self):
+        """Create a bilinear clamp-to-edge sampler for FXAA texture reads."""
+        desc = Metal.MTLSamplerDescriptor.alloc().init()
+        desc.setMinFilter_(Metal.MTLSamplerMinMagFilterLinear)
+        desc.setMagFilter_(Metal.MTLSamplerMinMagFilterLinear)
+        desc.setSAddressMode_(Metal.MTLSamplerAddressModeClampToEdge)
+        desc.setTAddressMode_(Metal.MTLSamplerAddressModeClampToEdge)
+        return self.device.newSamplerStateWithDescriptor_(desc)
+
+    def apply_fxaa(self, cmd) -> None:
+        """Dispatch FXAA compute kernel: render_target → fxaa_target.
+
+        Call this after the render encoder ends (MSAA resolved) but before
+        the readback blit.  The caller should then blit from ``fxaa_target``
+        instead of ``render_target``.
+        """
+        enc = cmd.computeCommandEncoder()
+        enc.setComputePipelineState_(self._fxaa_pso)
+        enc.setTexture_atIndex_(self.render_target, 0)  # input (resolved MSAA)
+        enc.setTexture_atIndex_(self.fxaa_target, 1)    # output
+        enc.setSamplerState_atIndex_(self._fxaa_sampler, 0)
+
+        # Use device-optimal thread group size
+        tw = self._fxaa_pso.threadExecutionWidth()
+        th = max(1, self._fxaa_pso.maxTotalThreadsPerThreadgroup() // tw)
+        thread_group_size = Metal.MTLSizeMake(tw, th, 1)
+        grid_size = Metal.MTLSizeMake(self.width, self.height, 1)
+        enc.dispatchThreads_threadsPerThreadgroup_(grid_size, thread_group_size)
+        enc.endEncoding()
+
     # ------------------------------------------------------------------
     # Rendering helpers
     # ------------------------------------------------------------------
@@ -488,16 +583,25 @@ class MetalContext:
             Metal.MTLResourceStorageModeShared,
         )
 
-    def blit_texture_to_readback(self, cmd) -> None:
-        """Append a blit encoder to *cmd* that copies the resolved texture to the readback buffer.
+    def blit_texture_to_readback(self, cmd, source=None) -> None:
+        """Append a blit encoder to *cmd* that copies a texture to the readback buffer.
+
+        Parameters
+        ----------
+        cmd
+            The command buffer to append to.
+        source
+            Texture to copy from.  Defaults to ``render_target``.
 
         The GPU handles untiling — much faster than CPU-side ``getBytes`` on
         Apple Silicon's unified memory.  Call this after the render encoder
         ends but before ``cmd.commit()``.
         """
+        if source is None:
+            source = self.render_target
         blit = cmd.blitCommandEncoder()
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_(
-            self.render_target,
+            source,
             0,
             0,
             Metal.MTLOriginMake(0, 0, 0),

@@ -76,7 +76,7 @@ def _load_lib() -> ctypes.CDLL | None:
 
     # void encode_draw_ops(void*, void*, const DrawOp*, int32_t,
     #                      void*, void*, void*, void*, void*, void*,
-    #                      void*, void*)
+    #                      void*, void*, void*, void*)
     lib.encode_draw_ops.restype = None
     lib.encode_draw_ops.argtypes = [
         ctypes.c_void_p,  # encoder
@@ -91,6 +91,8 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_void_p,  # stencil_disabled_dss
         ctypes.c_void_p,  # fill_cover_lit_pso
         ctypes.c_void_p,  # stroke_lit_pso
+        ctypes.c_void_p,  # stencil_nz_no_depth_write_dss
+        ctypes.c_void_p,  # stencil_disabled_no_depth_write_dss
     ]
 
     _lib = lib
@@ -149,4 +151,6 @@ def encode_draw_ops(
         objc.pyobjc_id(ctx._stencil_disabled_dss),
         objc.pyobjc_id(ctx._fill_cover_lit_pso),
         objc.pyobjc_id(ctx._stroke_lit_pso),
+        objc.pyobjc_id(ctx._stencil_nonzero_no_depth_write_dss),
+        objc.pyobjc_id(ctx._stencil_disabled_no_depth_write_dss),
     )
