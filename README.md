@@ -106,6 +106,23 @@ uv run python compare_video.py VTransform
 
 Diff images/videos are written under `media_compare/` and `media_vcmp/` (git-ignored).
 
+## Performance
+
+Render-time (not just accuracy) is benchmarked against Cairo by
+[`benchmark.py`](benchmark.py); full results in [BENCHMARK.md](BENCHMARK.md).
+On an Apple M3 Pro, per-frame `capture_mobjects` time:
+
+- **3D lit surfaces: ≈3–6× faster** — Cairo shades every facet on the CPU.
+- **Static-geometry 2D & text: ≈1.4–2.5× faster**, and the lead grows with resolution.
+- **Caveat:** when geometry changes every frame, the CPU tessellation (ear-clipping
+  per shape/glyph) re-runs and can make Metal *slower* than Cairo for 2D/text. Only
+  the moving objects re-tessellate, so real animations land between the cached and
+  uncached numbers. This is the main remaining optimization target.
+
+```bash
+uv run python benchmark.py --write-md     # regenerate BENCHMARK.md
+```
+
 ## Development
 
 ```bash
