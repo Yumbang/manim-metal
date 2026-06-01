@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
+try:
+    import mapbox_earcut as _earcut
+except ImportError:  # pragma: no cover - mapbox_earcut ships with manim
+    _earcut = None
+
 if TYPE_CHECKING:
     import numpy.typing as npt
 
@@ -14,6 +19,11 @@ if TYPE_CHECKING:
 # These are constant — computing them once avoids repeated power ops.
 # ---------------------------------------------------------------------------
 N_CURVE_SAMPLES = 64
+
+# A fill is treated as planar (lying in a z = const plane, e.g. all 2D shapes
+# and text glyphs) when its z extent is below this.  Planar fills use a robust
+# ear-clipping triangulation; genuinely 3D geometry keeps the centroid fan.
+_PLANAR_Z_EPS = 1e-6
 
 _t = np.linspace(0, 1, N_CURVE_SAMPLES, dtype=np.float64).reshape(N_CURVE_SAMPLES, 1, 1)
 _mt = 1.0 - _t
@@ -80,6 +90,116 @@ def _polyline_to_fan(polyline: npt.NDArray[np.float64]) -> npt.NDArray[np.float3
     triangles[:, 1, :] = polyline.astype(np.float32)
     triangles[:, 2, :] = np.roll(polyline, -1, axis=0).astype(np.float32)
     return triangles.reshape(-1, 3)
+
+
+def _subpath_rings(points: npt.NDArray[np.float64]) -> list[npt.NDArray[np.float64]]:
+    """Split a VMobject point array into linearized closed rings (one per subpath).
+
+    A new subpath starts wherever consecutive cubic Bézier curves are not
+    connected end-to-start.  Each ring is returned as a deduplicated (M, 2)
+    polyline in the XY plane.
+    """
+    n_curves = len(points) // 4
+    if n_curves == 0:
+        return []
+    ctrl = points[: n_curves * 4, :3].reshape(n_curves, 4, 3)
+
+    # Subpath boundaries: curve k's end point differs from curve k+1's start.
+    starts = [0]
+    for k in range(n_curves - 1):
+        if not np.allclose(ctrl[k, 3], ctrl[k + 1, 0], atol=1e-6):
+            starts.append(k + 1)
+    starts.append(n_curves)
+
+    rings: list[npt.NDArray[np.float64]] = []
+    for s in range(len(starts) - 1):
+        seg = ctrl[starts[s] : starts[s + 1]].reshape(-1, 3)
+        lin = _linearize_beziers_batch(seg)[:, :2]
+        # Drop consecutive duplicates (incl. the closing point).
+        keep = np.ones(len(lin), dtype=bool)
+        keep[1:] = np.any(np.abs(np.diff(lin, axis=0)) > 1e-9, axis=1)
+        lin = lin[keep]
+        if len(lin) >= 3:
+            rings.append(lin)
+    return rings
+
+
+def _point_in_polygon(p: npt.NDArray[np.float64], poly: npt.NDArray[np.float64]) -> bool:
+    """Vectorized even-odd ray-cast point-in-polygon test (XY plane)."""
+    x, y = float(p[0]), float(p[1])
+    px, py = poly[:, 0], poly[:, 1]
+    pxj, pyj = np.roll(px, 1), np.roll(py, 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x_cross = (pxj - px) * (y - py) / (pyj - py) + px
+    cond = ((py > y) != (pyj > y)) & (x < x_cross)
+    return bool(np.count_nonzero(cond) % 2 == 1)
+
+
+def _triangulate_planar_fill(
+    points: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float32] | None:
+    """Ear-clip a planar (XY) VMobject fill, handling nested holes.
+
+    Returns an (M, 3) float32 triangle-soup at the fill's constant z, or
+    ``None`` if ear clipping is unavailable or fails (caller then falls back
+    to the centroid fan).
+
+    Why this exists: the centroid triangle-fan produces long sub-pixel slivers
+    for small, thin-stroked shapes (e.g. superscript glyphs in ``MathTex``).
+    GPU fixed-point rasterization drops those slivers — position-dependently —
+    so such glyphs vanish.  Ear clipping yields well-shaped triangles that
+    rasterize robustly, matching Cairo.
+    """
+    if _earcut is None:
+        return None
+    rings = _subpath_rings(points)
+    if not rings:
+        return None
+
+    # Nesting depth via vertex containment: a ring at even depth is a filled
+    # region, odd depth is a hole.  Using a vertex (not the centroid, which can
+    # fall inside an annular hole) makes the test robust.
+    r = len(rings)
+    contains = np.zeros((r, r), dtype=bool)  # contains[j, i]: ring j holds ring i
+    for i in range(r):
+        v = rings[i][0]
+        for j in range(r):
+            if i != j and _point_in_polygon(v, rings[j]):
+                contains[j, i] = True
+    depth = contains.sum(axis=0)
+
+    z_const = float(np.mean(points[:, 2])) if points.shape[1] > 2 else 0.0
+    # 2D geometry projects z straight to NDC depth; a tiny *negative* z from
+    # float noise (common in LaTeX-derived glyph points, ~1e-17) would be
+    # clipped by Metal's near plane (z_ndc < 0), dropping the whole fill.
+    # Snap near-zero z to exactly 0 so planar fills always survive.
+    if abs(z_const) < _PLANAR_Z_EPS:
+        z_const = 0.0
+    tri_parts: list[npt.NDArray[np.float64]] = []
+    for i in range(r):
+        if depth[i] % 2 != 0:
+            continue  # a hole — emitted together with its parent fill ring
+        comp = [rings[i]]
+        ends = [len(rings[i])]
+        for k in range(r):
+            if depth[k] == depth[i] + 1 and contains[i, k]:
+                comp.append(rings[k])
+                ends.append(ends[-1] + len(rings[k]))
+        verts = np.concatenate(comp).astype(np.float64)
+        try:
+            idx = _earcut.triangulate_float64(verts, np.array(ends, dtype=np.uint32))
+        except Exception:
+            return None
+        if len(idx):
+            tri_parts.append(verts[np.asarray(idx, dtype=np.intp)].reshape(-1, 2))
+
+    if not tri_parts:
+        return None
+    flat = np.concatenate(tri_parts)
+    out = np.empty((len(flat), 3), dtype=np.float32)
+    out[:, :2] = flat
+    out[:, 2] = z_const
+    return out
 
 
 def _polyline_to_stroke(
@@ -1044,6 +1164,17 @@ def batch_tessellate(
             continue
 
         fill_tris = fan_chunks[nz_pos]
+        # Planar fills (2D shapes, text glyphs) use robust ear clipping; the
+        # centroid fan is kept for genuine 3D geometry and as a fallback.
+        # The normal-computing path keeps the fan (normals are derived from it).
+        if not compute_normals:
+            pts_i = items[i][0]
+            z = pts_i[:, 2]
+            if float(z.max() - z.min()) <= _PLANAR_Z_EPS:
+                earcut_tris = _triangulate_planar_fill(pts_i)
+                if earcut_tris is not None and len(earcut_tris) > 0:
+                    fill_tris = earcut_tris
+
         sq = stroke_results_per_nz[nz_pos]
         if stroke_width is not None and sq is None:
             sq = np.empty((0, 3), dtype=np.float32)

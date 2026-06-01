@@ -9,6 +9,7 @@ dependencies = [
     "pyobjc-framework-metal>=11.0",
     "pyobjc-framework-quartz>=11.0",
     "pyobjc-framework-metalkit>=11.0",
+    "mapbox-earcut>=2.0.0",
 ]
 
 [project.entry-points."manim.plugins"]
